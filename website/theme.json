@@ -1,0 +1,19 @@
+{
+  "name": "yonedarepo-app-light",
+  "domain": "distributed data systems / source control",
+  "note": "Owner override: matches the YonedaRepo app (light theme), not the skill's dark default.",
+  "colors": {
+    "bg": "#f6f8fb",
+    "surface": "#ffffff",
+    "text": "#152436",
+    "textMuted": "#56657a",
+    "border": "#e1e6ed",
+    "accent": "#245de8",
+    "accentSoft": "#edf3ff",
+    "success": "#157f72"
+  },
+  "font": "IBM Plex Sans / IBM Plex Mono",
+  "heroGradient": "none (flat #f6f8fb with soft-blue icon tile)",
+  "cardEffect": "white rounded card, 1px border, soft shadow",
+  "bgPattern": "none"
+}
