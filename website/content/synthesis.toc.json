@@ -1,0 +1,254 @@
+[
+ {
+  "id": "sec:syn:intro",
+  "num": "1",
+  "text": "Introduction",
+  "level": 2
+ },
+ {
+  "id": "sec:syn:precedent",
+  "num": "2",
+  "text": "Precedent and pressure",
+  "level": 2
+ },
+ {
+  "id": "files-to-tables-in-data-systems",
+  "num": "2.1",
+  "text": "Files to tables in data systems",
+  "level": 3
+ },
+ {
+  "id": "pressure-on-source-control",
+  "num": "2.2",
+  "text": "Pressure on source control",
+  "level": 3
+ },
+ {
+  "id": "the-same-move-in-scions-published-design",
+  "num": "2.3",
+  "text": "The same move in Scion’s published design",
+  "level": 3
+ },
+ {
+  "id": "scope-of-the-argument",
+  "num": "2.4",
+  "text": "Scope of the argument",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:model",
+  "num": "3",
+  "text": "A model of a transactional repository",
+  "level": 2
+ },
+ {
+  "id": "primitives",
+  "num": "3.1",
+  "text": "Primitives",
+  "level": 3
+ },
+ {
+  "id": "state-transactions-and-versions",
+  "num": "3.2",
+  "text": "State, transactions and versions",
+  "level": 3
+ },
+ {
+  "id": "views",
+  "num": "3.3",
+  "text": "Views",
+  "level": 3
+ },
+ {
+  "id": "cost",
+  "num": "3.4",
+  "text": "Cost",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:results",
+  "num": "4",
+  "text": "Principal results",
+  "level": 2
+ },
+ {
+  "id": "the-log",
+  "num": "4.1",
+  "text": "The log",
+  "level": 3
+ },
+ {
+  "id": "isolation",
+  "num": "4.2",
+  "text": "Isolation",
+  "level": 3
+ },
+ {
+  "id": "batches",
+  "num": "4.3",
+  "text": "Batches",
+  "level": 3
+ },
+ {
+  "id": "views-1",
+  "num": "4.4",
+  "text": "Views",
+  "level": 3
+ },
+ {
+  "id": "capacity",
+  "num": "4.5",
+  "text": "Capacity",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:composition",
+  "num": "5",
+  "text": "Composition of the parts",
+  "level": 2
+ },
+ {
+  "id": "consistent-views-under-concurrent-landing",
+  "num": "5.1",
+  "text": "Consistent views under concurrent landing",
+  "level": 3
+ },
+ {
+  "id": "git-semantics-off-the-landing-path",
+  "num": "5.2",
+  "text": "Git semantics off the landing path",
+  "level": 3
+ },
+ {
+  "id": "batch-size-and-isolation",
+  "num": "5.3",
+  "text": "Batch size and isolation",
+  "level": 3
+ },
+ {
+  "id": "reads-at-a-published-head",
+  "num": "5.4",
+  "text": "Reads at a published head",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:agents",
+  "num": "6",
+  "text": "Agents as concurrent transactions",
+  "level": 2
+ },
+ {
+  "id": "task-closures-as-access-sets",
+  "num": "6.1",
+  "text": "Task closures as access sets",
+  "level": 3
+ },
+ {
+  "id": "the-companion-paper-in-the-series",
+  "num": "6.2",
+  "text": "The companion paper in the series",
+  "level": 3
+ },
+ {
+  "id": "predictions-and-studies",
+  "num": "6.3",
+  "text": "Predictions and studies",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:evidence",
+  "num": "7",
+  "text": "Evidence",
+  "level": 2
+ },
+ {
+  "id": "setting",
+  "num": "7.1",
+  "text": "Setting",
+  "level": 3
+ },
+ {
+  "id": "correctness-evidence",
+  "num": "7.2",
+  "text": "Correctness evidence",
+  "level": 3
+ },
+ {
+  "id": "the-early-commit-path",
+  "num": "7.3",
+  "text": "The early commit path",
+  "level": 3
+ },
+ {
+  "id": "landing-under-bursts",
+  "num": "7.4",
+  "text": "Landing under bursts",
+  "level": 3
+ },
+ {
+  "id": "controlled-comparison-of-landing-modes",
+  "num": "7.5",
+  "text": "Controlled comparison of landing modes",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:batch",
+  "num": "7.6",
+  "text": "Batched landing",
+  "level": 3
+ },
+ {
+  "id": "defects-found-by-the-analysis",
+  "num": "7.7",
+  "text": "Defects found by the analysis",
+  "level": 3
+ },
+ {
+  "id": "the-model-against-the-measurements",
+  "num": "7.8",
+  "text": "The model against the measurements",
+  "level": 3
+ },
+ {
+  "id": "sec:syn:scion",
+  "num": "8",
+  "text": "Relation to Scion",
+  "level": 2
+ },
+ {
+  "id": "sec:syn:related",
+  "num": "9",
+  "text": "Related work",
+  "level": 2
+ },
+ {
+  "id": "sec:syn:open",
+  "num": "10",
+  "text": "Open problems",
+  "level": 2
+ },
+ {
+  "id": "sec:syn:threats",
+  "num": "11",
+  "text": "Threats to validity",
+  "level": 2
+ },
+ {
+  "id": "sec:syn:conclusion",
+  "num": "12",
+  "text": "Conclusion",
+  "level": 2
+ },
+ {
+  "id": "references",
+  "num": "",
+  "text": "References",
+  "level": 2
+ },
+ {
+  "id": "app:syn:evidence",
+  "num": "A",
+  "text": "Code evidence",
+  "level": 2
+ }
+]

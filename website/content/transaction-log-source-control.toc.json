@@ -1,0 +1,260 @@
+[
+ {
+  "id": "sec:tlsc:intro",
+  "num": "1",
+  "text": "Introduction",
+  "level": 2
+ },
+ {
+  "id": "sec:tlsc:problem",
+  "num": "2",
+  "text": "The coordination problem",
+  "level": 2
+ },
+ {
+  "id": "gits-unit-of-coordination",
+  "num": "2.1",
+  "text": "Git’s unit of coordination",
+  "level": 3
+ },
+ {
+  "id": "always-online-writers",
+  "num": "2.2",
+  "text": "Always-online writers",
+  "level": 3
+ },
+ {
+  "id": "requirements",
+  "num": "2.3",
+  "text": "Requirements",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:components",
+  "num": "3",
+  "text": "Design",
+  "level": 2
+ },
+ {
+  "id": "objects",
+  "num": "3.1",
+  "text": "Objects",
+  "level": 3
+ },
+ {
+  "id": "workspace-changesets",
+  "num": "3.2",
+  "text": "Workspace changesets",
+  "level": 3
+ },
+ {
+  "id": "protected-refs",
+  "num": "3.3",
+  "text": "Protected refs",
+  "level": 3
+ },
+ {
+  "id": "compute",
+  "num": "3.4",
+  "text": "Compute",
+  "level": 3
+ },
+ {
+  "id": "commit-creation-and-ref-moves",
+  "num": "3.5",
+  "text": "Commit creation and ref moves",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:n11",
+  "num": "3.6",
+  "text": "Realizations of landing",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:framework",
+  "num": "4",
+  "text": "Mathematical framework",
+  "level": 2
+ },
+ {
+  "id": "objects-trees-and-commits",
+  "num": "4.1",
+  "text": "Objects, trees and commits",
+  "level": 3
+ },
+ {
+  "id": "locations-and-access-sets",
+  "num": "4.2",
+  "text": "Locations and access sets",
+  "level": 3
+ },
+ {
+  "id": "the-transaction-log",
+  "num": "4.3",
+  "text": "The transaction log",
+  "level": 3
+ },
+ {
+  "id": "snapshots-replay-and-checkpoints",
+  "num": "4.4",
+  "text": "Snapshots, replay and checkpoints",
+  "level": 3
+ },
+ {
+  "id": "the-authority-and-its-commands",
+  "num": "4.5",
+  "text": "The authority and its commands",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:log",
+  "num": "5",
+  "text": "Properties of the log",
+  "level": 2
+ },
+ {
+  "id": "replay-and-checkpoints",
+  "num": "5.1",
+  "text": "Replay and checkpoints",
+  "level": 3
+ },
+ {
+  "id": "refs-only-advance",
+  "num": "5.2",
+  "text": "Refs only advance",
+  "level": 3
+ },
+ {
+  "id": "snapshot-immutability",
+  "num": "5.3",
+  "text": "Snapshot immutability",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:delta",
+  "num": "5.4",
+  "text": "Relation to the Delta log",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:occ",
+  "num": "6",
+  "text": "Concurrency control",
+  "level": 2
+ },
+ {
+  "id": "validation-against-committed-entries",
+  "num": "6.1",
+  "text": "Validation against committed entries",
+  "level": 3
+ },
+ {
+  "id": "correspondence-with-kung-and-robinson",
+  "num": "6.2",
+  "text": "Correspondence with Kung and Robinson",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:isolation",
+  "num": "6.3",
+  "text": "Isolation levels",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:eq1",
+  "num": "6.4",
+  "text": "Independence as a scheduling rule",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:combiner",
+  "num": "7",
+  "text": "The land combiner",
+  "level": 2
+ },
+ {
+  "id": "mechanism",
+  "num": "7.1",
+  "text": "Mechanism",
+  "level": 3
+ },
+ {
+  "id": "safety",
+  "num": "7.2",
+  "text": "Safety",
+  "level": 3
+ },
+ {
+  "id": "write-skew-inside-a-batch",
+  "num": "7.3",
+  "text": "Write skew inside a batch",
+  "level": 3
+ },
+ {
+  "id": "liveness-and-post-land-checks",
+  "num": "7.4",
+  "text": "Liveness and post-land checks",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:n11proof",
+  "num": "8",
+  "text": "Changeset landing",
+  "level": 2
+ },
+ {
+  "id": "sec:tlsc:invariants",
+  "num": "9",
+  "text": "Formal invariants",
+  "level": 2
+ },
+ {
+  "id": "sec:tlsc:evidence",
+  "num": "10",
+  "text": "Evidence",
+  "level": 2
+ },
+ {
+  "id": "correctness-evidence",
+  "num": "10.1",
+  "text": "Correctness evidence",
+  "level": 3
+ },
+ {
+  "id": "hosted-landing-behaviour",
+  "num": "10.2",
+  "text": "Hosted landing behaviour",
+  "level": 3
+ },
+ {
+  "id": "sec:tlsc:related",
+  "num": "11",
+  "text": "Related work",
+  "level": 2
+ },
+ {
+  "id": "sec:tlsc:limits",
+  "num": "12",
+  "text": "Limitations",
+  "level": 2
+ },
+ {
+  "id": "sec:tlsc:conclusion",
+  "num": "13",
+  "text": "Conclusion",
+  "level": 2
+ },
+ {
+  "id": "references",
+  "num": "",
+  "text": "References",
+  "level": 2
+ },
+ {
+  "id": "app:tlsc:evidence",
+  "num": "A",
+  "text": "Code evidence",
+  "level": 2
+ }
+]

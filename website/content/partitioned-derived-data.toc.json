@@ -1,0 +1,122 @@
+[
+ {
+  "id": "sec:pdd:intro",
+  "num": "1",
+  "text": "Introduction",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:setting",
+  "num": "2",
+  "text": "Setting and imported objects",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:jobs",
+  "num": "3",
+  "text": "The job model",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:fold",
+  "num": "4",
+  "text": "Derived data as a fold over the commit DAG",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:incremental",
+  "num": "5",
+  "text": "Incremental correctness",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:search",
+  "num": "6",
+  "text": "Search as a partitioned read job",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:prefix",
+  "num": "7",
+  "text": "The prefix defect in the search key",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:history",
+  "num": "8",
+  "text": "History, checks and seeds",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:write",
+  "num": "9",
+  "text": "Write jobs",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:plan",
+  "num": "10",
+  "text": "Semantic partitioning and the plan DAG",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:granularity",
+  "num": "11",
+  "text": "Partition granularity",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:vacuum",
+  "num": "12",
+  "text": "Vacuum",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:git",
+  "num": "13",
+  "text": "Git as a derived view",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:evidence",
+  "num": "14",
+  "text": "Evidence",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:related",
+  "num": "15",
+  "text": "Related work",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:limits",
+  "num": "16",
+  "text": "Limitations",
+  "level": 2
+ },
+ {
+  "id": "sec:pdd:conclusion",
+  "num": "17",
+  "text": "Conclusion",
+  "level": 2
+ },
+ {
+  "id": "app:pdd:evidence",
+  "num": "A",
+  "text": "Code evidence",
+  "level": 2
+ },
+ {
+  "id": "app:pdd:prefixtest",
+  "num": "B",
+  "text": "Executed check of the prefix defect",
+  "level": 2
+ },
+ {
+  "id": "references",
+  "num": "",
+  "text": "References",
+  "level": 2
+ }
+]

@@ -1,0 +1,40 @@
+.DS_Store
+# LaTeX aux files
+*.aux
+*.log
+*.toc
+*.out
+*.bbl
+*.blg
+*.nav
+*.snm
+*.vrb
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+# Website build output
+website/node_modules/
+website/.next/
+website/out/
+website/.vercel/
+# Reviewer mutex (mkdir-based lock, see Tool Resolution)
+.review.lock/
+# Source preprints are not redistributable — link them from sources/README.md instead
+sources/*.pdf
+sources/*.txt
+# Private design notes and measurement ledger inputs never ship
+sources/internal/
+# Build scratch and Codex mutex
+.build/
+.codex.lock/
+# Pipeline internals: the ledger and KB cite private evidence and session transcripts
+team/
+.knowledge-base.md
+# Codex transcripts quote private yonedarepo source and local paths; results are summarized in README
+reviews/*codex-review*.md
+reviews/*code-audit*.md
+# Vercel env pulls
+.env*
+website/.env*
+# Build copies; canonical PDFs live in papers/pdf
+papers/latex/*.pdf

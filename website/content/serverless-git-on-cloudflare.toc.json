@@ -1,0 +1,272 @@
+[
+ {
+  "id": "sec:sgoc:intro",
+  "num": "1",
+  "text": "Introduction",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:model",
+  "num": "2",
+  "text": "System model",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:mapping",
+  "num": "3",
+  "text": "Primitives and the reference realization",
+  "level": 2
+ },
+ {
+  "id": "the-serialized-authority",
+  "num": "3.1",
+  "text": "The serialized authority",
+  "level": 3
+ },
+ {
+  "id": "the-object-store-and-the-git-projection",
+  "num": "3.2",
+  "text": "The object store and the Git projection",
+  "level": 3
+ },
+ {
+  "id": "read-tiers",
+  "num": "3.3",
+  "text": "Read tiers",
+  "level": 3
+ },
+ {
+  "id": "asynchronous-and-heavy-work",
+  "num": "3.4",
+  "text": "Asynchronous and heavy work",
+  "level": 3
+ },
+ {
+  "id": "request-paths-and-serialization-points",
+  "num": "3.5",
+  "text": "Request paths and serialization points",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:limits",
+  "num": "4",
+  "text": "Realization limits",
+  "level": 2
+ },
+ {
+  "id": "the-single-threaded-authority",
+  "num": "4.1",
+  "text": "The single-threaded authority",
+  "level": 3
+ },
+ {
+  "id": "the-receive-pack-limit",
+  "num": "4.2",
+  "text": "The receive-pack limit",
+  "level": 3
+ },
+ {
+  "id": "object-store-write-limits",
+  "num": "4.3",
+  "text": "Object-store write limits",
+  "level": 3
+ },
+ {
+  "id": "worker-connections-and-subrequests",
+  "num": "4.4",
+  "text": "Worker connections and subrequests",
+  "level": 3
+ },
+ {
+  "id": "other-limits",
+  "num": "4.5",
+  "text": "Other limits",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:measured",
+  "num": "5",
+  "text": "Measured evaluation",
+  "level": 2
+ },
+ {
+  "id": "environment-and-workloads",
+  "num": "5.1",
+  "text": "Environment and workloads",
+  "level": 3
+ },
+ {
+  "id": "concurrent-writers-across-revisions",
+  "num": "5.2",
+  "text": "Concurrent writers across revisions",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:batch",
+  "num": "5.3",
+  "text": "Batched landing on the development branch, measured",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:changeset",
+  "num": "5.4",
+  "text": "Controlled comparison of landing modes",
+  "level": 3
+ },
+ {
+  "id": "commit-time-by-phase",
+  "num": "5.5",
+  "text": "Commit time by phase",
+  "level": 3
+ },
+ {
+  "id": "landing-under-a-burst",
+  "num": "5.6",
+  "text": "Landing under a burst",
+  "level": 3
+ },
+ {
+  "id": "reads-commit-cost-clones-and-checks",
+  "num": "5.7",
+  "text": "Reads, commit cost, clones and checks",
+  "level": 3
+ },
+ {
+  "id": "local-measurements",
+  "num": "5.8",
+  "text": "Local measurements",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:capacity",
+  "num": "6",
+  "text": "Capacity model",
+  "level": 2
+ },
+ {
+  "id": "definitions-and-assumptions",
+  "num": "6.1",
+  "text": "Definitions and assumptions",
+  "level": 3
+ },
+ {
+  "id": "bounds",
+  "num": "6.2",
+  "text": "Bounds",
+  "level": 3
+ },
+ {
+  "id": "model-inputs",
+  "num": "6.3",
+  "text": "Model inputs",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:calibration",
+  "num": "7",
+  "text": "Calibration",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:projected",
+  "num": "8",
+  "text": "Projected capacity",
+  "level": 2
+ },
+ {
+  "id": "workload-shape",
+  "num": "8.1",
+  "text": "Workload shape",
+  "level": 3
+ },
+ {
+  "id": "configurations",
+  "num": "8.2",
+  "text": "Configurations",
+  "level": 3
+ },
+ {
+  "id": "ceilings-and-knees",
+  "num": "8.3",
+  "text": "Ceilings and knees",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:projected-vs-measured",
+  "num": "8.4",
+  "text": "Projections against measurements",
+  "level": 3
+ },
+ {
+  "id": "commit-latency",
+  "num": "8.5",
+  "text": "Commit latency",
+  "level": 3
+ },
+ {
+  "id": "scale-against-the-scion-workload",
+  "num": "8.6",
+  "text": "Scale against the Scion workload",
+  "level": 3
+ },
+ {
+  "id": "sensitivity",
+  "num": "8.7",
+  "text": "Sensitivity",
+  "level": 3
+ },
+ {
+  "id": "validation-runs",
+  "num": "8.8",
+  "text": "Validation runs",
+  "level": 3
+ },
+ {
+  "id": "sec:sgoc:planned",
+  "num": "9",
+  "text": "Planned evaluation",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:deviations",
+  "num": "10",
+  "text": "Deviations from Scion",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:threats",
+  "num": "11",
+  "text": "Threats to validity",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:related",
+  "num": "12",
+  "text": "Related systems",
+  "level": 2
+ },
+ {
+  "id": "sec:sgoc:conclusion",
+  "num": "13",
+  "text": "Conclusion",
+  "level": 2
+ },
+ {
+  "id": "references",
+  "num": "",
+  "text": "References",
+  "level": 2
+ },
+ {
+  "id": "app:sgoc:evidence",
+  "num": "A",
+  "text": "Code evidence",
+  "level": 2
+ },
+ {
+  "id": "app:sgoc:arithmetic",
+  "num": "B",
+  "text": "Model arithmetic",
+  "level": 2
+ }
+]

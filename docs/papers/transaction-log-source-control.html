@@ -1,0 +1,995 @@
+<h2 data-number="1" id="sec:tlsc:intro"><span class="header-section-number">1</span> Introduction</h2>
+<p>Source code and source control are now transactional abstractions. A repository is a database whose state is a set of refs over immutable objects. A change is a transaction that reads part of the source and writes another part. Landing a change is a commit under optimistic concurrency control, and a version of the repository is a snapshot. This paper lays the base layer of that view: a transaction model for source control, with its log, its snapshots, its isolation level, its validation rule and its serializability guarantee, together with the place where the implemented system falls short of the model.</p>
+<p>We argue that this is the next step in how code is managed, and that data took the same step first. Data lakes began as files on object stores; concurrent writers and derived computation broke file-level semantics, and the field moved to tables with a transaction log, snapshots and optimistic concurrency [<a href="#bib-armbrust2020delta">3</a>, <a href="#bib-icebergspec">21</a>], with partitioned computation running over those snapshots [<a href="#bib-zaharia2012rdd">32</a>]. Agents now put source control under the same pressure, by multiplying concurrent writers and the volume of derived work. Scion’s published design makes the same move: it creates changesets on the server as entries in a write-ahead log and keeps the ref update as a compare-and-swap on one database row, separate from commit creation [<a href="#bib-anthropic2026scion">2</a>]. This series supplies foundations for that move, and the proofs and measurements of Parts I to III are the evidence for the thesis.</p>
+<p>Source control was designed for people. A developer clones a repository, edits files on a local disk, builds a commit, and pushes it. The server sees a finished commit and one request to move a branch from an old value to a new one. If the branch moved in the meantime, the push is refused and the developer fetches, rebases, retests and tries again. This loop is cheap when conflicts are rare and the writer is patient. It is expensive when writers are numerous, short-lived and always online, and when each of them writes a few files against the same branch head.</p>
+<p>That situation now exists. Anthropic reports that its merge rate grew from about 2,500 code changes per day in May 2026 to more than 30,000 per day by September, and that git traffic, mirror drift and merge coordination became its largest development bottleneck [<a href="#bib-anthropic2026scion">2</a>]. Its response, a system called Scion, replaces commits created on clients with changesets created on the server as entries in a write-ahead log, and moves a ref by a compare-and-swap on a single database row that is not involved in creating or fetching commits [<a href="#bib-anthropic2026scion">2</a>].</p>
+<p>This paper studies the same problem from the side of data systems. We treat a repository the way Delta Lake treats a table [<a href="#bib-armbrust2020delta">3</a>]. Immutable objects play the role of data files. An append-only, hash-chained transaction log records every ref change. Checkpoints summarize the log so that any version can be reconstructed cheaply. Readers pin a version and see a snapshot. Writers validate optimistically against what has been committed since they read. The analogy is close enough to transfer the main correctness arguments, and it fails in two places that matter: the snapshot of a repository is a map of refs, not a set of files, and two writers that touch the same file can often both succeed through a three-way merge, which has no counterpart in a table.</p>
+<p>The architecture needs four primitives: an immutable, content-addressed object store; a serialized authority per repository that holds durable state and executes each command atomically; a durable queue with retries; and stateless compute. The log, the refs and the validation logic live in the serialized authority, which supplies the atomic step that Delta Lake obtains from put-if-absent writes to an object store [<a href="#bib-armbrust2020delta">3</a>]. Every theorem in this paper is stated over these primitives. Scion’s ref update, a compare-and-swap on one Spanner row [<a href="#bib-anthropic2026scion">2</a>, <a href="#bib-corbett2012spanner">10</a>], shows that a serialized authority of this kind is available outside the platform we used.</p>
+<p>The reference implementation, YonedaRepo, is first-party work: the author designed and built it. It offers Git semantics (commits, branches, merges, diffs and logs) with Git object identifiers, so every commit it exposes can be fetched and verified by stock Git. It realizes the primitives on Cloudflare, with a Durable Object as the serialized authority [<a href="#bib-cfdoconcepts">8</a>, <a href="#bib-cfdosqlite">9</a>]; Part III gives the mapping of each primitive to a product and the measured cost of the authority (Part III, Sections 3, 5 and 6) [<a href="#bib-long2026partIII">26</a>]. Part II describes derived data as views maintained from the log [<a href="#bib-long2026partII">25</a>].</p>
+<p>The paper makes five contributions.</p>
+<ol>
+<li><p>A formal model of a source repository as a transaction log over content-addressed Git objects, with snapshots, checkpoints and time travel by version or commit (Section <a href="#sec:tlsc:framework">4</a>).</p></li>
+<li><p>Proofs that replay is deterministic, that snapshots are immutable, that refs only advance along first-parent chains in the implemented system, and that no landed change is lost (Section <a href="#sec:tlsc:log">5</a>).</p></li>
+<li><p>A serializability theorem for landings validated against declared read sets, with a mapping to the validation conditions of Kung and Robinson [<a href="#bib-kung1981occ">23</a>], and an exact characterization of the companion paper’s independence condition (Eq. 1 of [<a href="#bib-long2026inversion">24</a>]) as the condition for order-insensitive landing without a merge (Section <a href="#sec:tlsc:occ">6</a>).</p></li>
+<li><p>An analysis of the group-landing combiner that proves it preserves the single-writer property of the ref update, shows by counterexample that it admits write skew between members of one batch, and gives a sufficient condition that removes the anomaly (Section <a href="#sec:tlsc:combiner">7</a>).</p></li>
+<li><p>A statement of the intended changeset landing path, in which the Git commit of a branch is a deterministic function of the log prefix, and a check of which results carry over to it unchanged (Section <a href="#sec:tlsc:n11proof">8</a>).</p></li>
+</ol>
+<p>The measured evidence in Section <a href="#sec:tlsc:evidence">10</a> is correctness evidence first: Git object identity, agreement of the merge with Git, and concurrent landings without loss. The hosted latency of the write path misses its design target, and we say so there.</p>
+<h2 data-number="2" id="sec:tlsc:problem"><span class="header-section-number">2</span> The coordination problem</h2>
+<h3 data-number="2.1" id="gits-unit-of-coordination"><span class="header-section-number">2.1</span> Git’s unit of coordination</h3>
+<p>Git names every object by the SHA-1 digest of a short header and the object’s bytes [<a href="#bib-gitobjects">18</a>]. A commit names one tree and its parents; a tree names blobs and subtrees. The naming makes objects immutable and verifiable by anyone who holds them, which is the property every later design keeps.</p>
+<p>Coordination in Git happens at refs. A push sends, for each ref, a command with the old and new object identifiers, followed by a pack of objects; the server unpacks the objects, checks that each ref still has the old value the client named, and updates it [<a href="#bib-gitprotocol">19</a>]. The ref update is therefore a compare-and-swap. Everything before it, including building the commit, computing which objects the server lacks and producing the pack, happens on the client. When the swap fails, all of that work is stale. The client must fetch the new head, rebuild its commit on top of it, rerun whatever checks it trusts, and push again.</p>
+<p>For a person, this loop is a minor tax. For a large population of writers that share a branch, the loop becomes the system. Each failed swap converts into a fetch, a rebase and a retry, and the probability of failing grows with the rate at which others land. The cost of a lost race is paid on the client, where the writer cannot see what else is happening, and it is paid in full even when the competing change touched unrelated files.</p>
+<h3 data-number="2.2" id="always-online-writers"><span class="header-section-number">2.2</span> Always-online writers</h3>
+<p>An agent that edits code differs from a person in three ways that matter here. It is always online, so it does not need an offline copy of history. It is short-lived, so a full clone is mostly wasted work. It usually changes a few files and could tell the server what it read and what it wrote. None of these facts is exploited by the push protocol, which assumes that the client holds the history and the server holds only the result.</p>
+<p>The Scion post quantifies the consequences at one company: a main-branch history of almost 100 GB, compressed working copies over 25 GB, on the order of 25 million CI checkouts per day, and an estimated 600 PB per day of git traffic if every checkout fetched naively [<a href="#bib-anthropic2026scion">2</a>]. Several hundred git mirrors were needed to carry the load, and their seeds drifted from the main branch between refreshes [<a href="#bib-anthropic2026scion">2</a>]. The post also argues that a strict merge queue does not suit agent-scale merging, because many changes land while any one change is being tested [<a href="#bib-anthropic2026scion">2</a>]. These are reported figures from one organization’s production system. We use them as motivation, not as measurements of the system studied here.</p>
+<h3 data-number="2.3" id="requirements"><span class="header-section-number">2.3</span> Requirements</h3>
+<p>From these observations we draw five requirements for a replacement processing model. They are design requirements, not empirical claims.</p>
+<dl>
+<dt>D1, server-side changes.</dt>
+<dd>
+<p>A writer sends file changes and receives a commit identifier. The server builds trees and commits and stores the objects.</p>
+</dd>
+<dt>D2, creation separate from landing.</dt>
+<dd>
+<p>Creating a commit must not move a ref, so that commits can be created in parallel without coordination and checked before they land.</p>
+</dd>
+<dt>D3, cheap lost races.</dt>
+<dd>
+<p>When the branch moved, the server should decide from recorded metadata whether the change still holds, and merge it without a client round trip when it does.</p>
+</dd>
+<dt>D4, contention-free reads.</dt>
+<dd>
+<p>Reads should name an immutable version and never wait for writers.</p>
+</dd>
+<dt>D5, Git semantics.</dt>
+<dd>
+<p>Writers and readers should see commits, branches, merges, diffs and logs with Git’s meaning, and a branch should be exportable as Git objects that existing tools can fetch and verify.</p>
+</dd>
+</dl>
+<p>Scion meets D1 to D4 with its own changeset format and describes itself as not a general Git replacement [<a href="#bib-anthropic2026scion">2</a>]. The design here meets D1 to D4 with the log described below. D5 constrains what the log must be able to produce, not what a landing must write: the Git objects of a branch can be built from the log, as Section <a href="#sec:tlsc:n11">3.6</a> explains.</p>
+<h2 data-number="3" id="sec:tlsc:components"><span class="header-section-number">3</span> Design</h2>
+<p>The design has four components, each built on the primitives named in the introduction. Table <a href="#tab:tlsc:components">1</a> compares each with its counterpart in Scion. Part III maps the primitives to products in the reference implementation.</p>
+<table id="tab:tlsc:components">
+<caption>The four components. Scion’s column paraphrases the Scion post [<a href="#bib-anthropic2026scion">2</a>].</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Component</th>
+<th style="text-align: left;">Scion</th>
+<th style="text-align: left;">This architecture</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Objects</td>
+<td style="text-align: left;">Content-addressed compressed blobs in cloud storage behind cache tiers</td>
+<td style="text-align: left;">Git blobs, trees and commits in an object store, read through caches keyed by object identifier</td>
+</tr>
+<tr>
+<td style="text-align: left;">Workspace changesets</td>
+<td style="text-align: left;">Write-ahead log entries listing files changed against the first parent</td>
+<td style="text-align: left;">Commits built and recorded by the authority, with their changed paths, before any ref moves</td>
+</tr>
+<tr>
+<td style="text-align: left;">Protected refs</td>
+<td style="text-align: left;">A compare-and-swap on one Spanner row per ref</td>
+<td style="text-align: left;">Refs and one transaction log per repository in the serialized authority</td>
+</tr>
+<tr>
+<td style="text-align: left;">Compute</td>
+<td style="text-align: left;">Server-side services for merge, derived data and checks</td>
+<td style="text-align: left;">Stateless functions for merge, rewrite and search, container compute for checks, and a durable queue for follow-up work</td>
+</tr>
+</tbody>
+</table>
+<h3 data-number="3.1" id="objects"><span class="header-section-number">3.1</span> Objects</h3>
+<p>Objects are Git objects with Git identifiers. The platform computes the identifier of a blob, tree or commit as the SHA-1 of the header <code>&lt;type&gt; &lt;size&gt;\0</code> followed by the bytes, the same rule Git uses [<a href="#bib-gitobjects">18</a>], and its codec reproduces identifiers that Git itself computes with <code>hash-object</code>, <code>mktree</code> and <code>commit-tree</code> (Appendix <a href="#app:tlsc:evidence">A</a>). Packs sent to the object store contain only whole objects; the reader refuses deltified entries.</p>
+<p>In the reference implementation at <code>cfa4845</code>, Git objects live in a Cloudflare Artifacts repository, with R2 and an edge cache as read-through tiers. Later revisions of the development branch make R2 the store of record and push only protected refs to Artifacts (Part III, Section 3.2).</p>
+<p>Every recorded commit is kept reachable in the object store by a hidden ref named after the commit, so that work which no branch points at yet cannot be collected. The only maintenance the platform performs is releasing these hidden refs once a commit is safely reachable from a branch or once unlanded work has expired; Part II analyzes that procedure in its Proposition 12.1.</p>
+<h3 data-number="3.2" id="workspace-changesets"><span class="header-section-number">3.2</span> Workspace changesets</h3>
+<p>A writer sends a list of file changes, a parent commit, a base log version, an optional declared read set and a message. The authority computes the new tree by rewriting only the directories on changed paths, asks the adapter for exactly the existing trees it needs, verifies every supplied tree against its identifier, and returns the objects to upload. After the adapter has pushed the objects and read the commit back from the object store, the authority records it. A recorded commit carries its tree, its parents, its base version, its read set and its list of changed paths relative to the first parent. In the words of the code, it is durable, addressable work that no ref points at yet.</p>
+<p>The rewrite gives the scaling property Scion asks for: the number of trees read and written depends on the directories along the changed paths, not on the number of files in the repository. Proposition <a href="#prop:tlsc:rewrite">4.3</a> states this precisely.</p>
+<h3 data-number="3.3" id="protected-refs"><span class="header-section-number">3.3</span> Protected refs</h3>
+<p>Refs live in one table inside the repository’s serialized authority, next to the transaction log, the checkpoints, the land queue and the table of landings. A landing is one call into the authority. The call reads the ref, validates the change against the log, and either refuses or appends one log entry and updates the ref, all as one atomic command. The contract the design needs from the authority is that its commands behave as if executed one at a time, each committing all of its writes or none. No network input or output happens inside a command: object pushes and reads happen in the adapter before the authority is called. These two properties are the basis of the formal model in Section <a href="#sec:tlsc:framework">4</a>. The reference implementation obtains them from a Durable Object, which runs one request at a time and whose synchronous SQLite transactions are all-or-nothing [<a href="#bib-cfdoconcepts">8</a>, <a href="#bib-cfdosqlite">9</a>]. A transactional database that offers serializable transactions over the ref row and the log tail would provide the same contract.</p>
+<p>The design deviates from Scion in one respect that matters for capacity. Scion places each ref on its own database row [<a href="#bib-anthropic2026scion">2</a>]. This architecture places all refs of a repository, and the preparation and recording of every commit, behind one authority. Serialization is therefore per repository, not per ref. That is a choice of key for the authority, not a property of the primitive, and a realization could key authorities by ref instead. Part III measures the consequences in its Sections 4 to 6.</p>
+<h3 data-number="3.4" id="compute"><span class="header-section-number">3.4</span> Compute</h3>
+<p>Diffs, three-way merges, tree rewrites, symbol extraction and search run as stateless functions called from the adapter; in the reference implementation they are Rust compiled to WebAssembly and run in Workers. Checks run in container compute on the exact commit they certify. A durable queue carries derived-data jobs and ref projection to the Git-facing store. None of these components holds authority: their outputs are either content-addressed objects, which anyone can verify by hashing, or proposals that the authority verifies before it accepts them.</p>
+<figure id="fig:tlsc:path" data-latex-placement="t">
+<img src="/figures/transaction-log-source-control-fig1.svg" />
+<figcaption>The write path. Creating a commit (prepare, push, read back, record) and landing it are separate calls. Only the land call reads and updates refs, and it performs no network input or output while it holds the authority’s transaction.</figcaption>
+</figure>
+<h3 data-number="3.5" id="commit-creation-and-ref-moves"><span class="header-section-number">3.5</span> Commit creation and ref moves</h3>
+<p>Figure <a href="#fig:tlsc:path">1</a> shows the separation that requirement D2 asks for. A commit is created by four steps that never touch a ref: prepare, push, read back and record. Reviews and check results attach to the commit identifier. Landing is a fifth, separate step. Its gates require the configured approvals and passing results for the required checks, bound to the policy in force; a change whose every file falls in a class the policy marks safe, such as comments only, counts as approved, and an unclassified change never does. Landing then validates and appends. If the branch moved and the change needs a merge, the platform builds a merge commit with its own compute, records it under the principal <code>platform:merge</code>, and lands that merge in place of the original commit. Original commit identifiers are never rewritten.</p>
+<h3 data-number="3.6" id="sec:tlsc:n11"><span class="header-section-number">3.6</span> Realizations of landing</h3>
+<p>The reference implementation first landed commits: every landing that is not a fast-forward builds a platform merge commit, with new tree objects on every changed path, before the authority appends the entry. This tree-building landing is the path the code evidence of Sections <a href="#sec:tlsc:framework">4</a> to <a href="#sec:tlsc:combiner">7</a> describes, at revision <code>cfa4845</code>, and it was still the landing path of the development branch at revision <code>03821e0</code>. Building Git objects on the landing path is a choice of that implementation, not a requirement of D5.</p>
+<p>The architecture’s intended landing path lands changesets instead. It was first implemented and measured at revision <code>dd6c9a8</code> on the branch <code>claude/native-p95e</code>, and it is merged into the development branch at revision <code>fef94e7</code>. A landing carries a base version, a declared read set and a list of file changes. The authority validates it by path overlap against the log entries since its base, which is a query on the log, and appends one entry; many landings share one authority command. Two paths result. When the changeset’s paths are disjoint from every later entry’s paths, landing is the validation query and the append, with no file content read. When a later entry wrote one of the same files, landing takes the merge path, which reads the three versions of each shared file and runs the three-way merge. The Git commit of the branch is built afterwards, in the background, as a deterministic function of the log prefix: the same prefix always yields the same commit identifier. Part II treats that projection as a derived view of the log. The cost is that a branch’s Git identifier becomes available after its landing returns rather than with it. At <code>fef94e7</code>, 1,000 of 1,000 concurrent writers landed in each of six hosted bursts on the reference implementation. Part III reports its latency and throughput.</p>
+<p>Every result of Sections <a href="#sec:tlsc:log">5</a> to <a href="#sec:tlsc:combiner">7</a> is stated over log entries, read sets, write sets and validation outcomes. Section <a href="#sec:tlsc:n11proof">8</a> checks which of them carry over to changeset landing unchanged and which become properties of the projection.</p>
+<h2 data-number="4" id="sec:tlsc:framework"><span class="header-section-number">4</span> Mathematical framework</h2>
+<p>This section states the model. Each definition corresponds to a data structure or function in the implementation; Appendix <a href="#app:tlsc:evidence">A</a> gives the file and commit for each.</p>
+<h3 data-number="4.1" id="objects-trees-and-commits"><span class="header-section-number">4.1</span> Objects, trees and commits</h3>
+<div class="definition">
+<p><strong>Definition 4.1</strong> (Object store). <span id="def:tlsc:objects" data-label="def:tlsc:objects"></span> Let <span class="math inline">\(\mathit{Id}\)</span> be the set of 160-bit identifiers. An <em>object store</em> is a finite partial map <span class="math inline">\(O:\mathit{Id}\rightharpoonup\mathit{Type}\times\mathit{Bytes}\)</span>, with <span class="math inline">\(\mathit{Type}=\{\mathrm{blob},\mathrm{tree},\mathrm{commit},\mathrm{tag}\}\)</span>, such that <span class="math inline">\(O(x)=(k,b)\)</span> implies <span class="math inline">\(x=H(\mathit{hdr}(k,b)\,\|\,b)\)</span>, where <span class="math inline">\(H\)</span> is SHA-1 and <span class="math inline">\(\mathit{hdr}(k,b)\)</span> is Git’s header naming the type <span class="math inline">\(k\)</span> and the length of <span class="math inline">\(b\)</span>. The store only grows: if <span class="math inline">\(O\subseteq O&#39;\)</span> describes two moments in time, every object of <span class="math inline">\(O\)</span> is in <span class="math inline">\(O&#39;\)</span> with the same type and bytes.</p>
+</div>
+<p>Content addressing makes an object immutable by construction. Two stores that hold an identifier hold the same bytes, unless <span class="math inline">\(H\)</span> has a collision. All results below assume that no collision occurs among the objects of one repository; Git makes the same assumption, and its hash transition to SHA-256 would weaken it further without changing any argument here.</p>
+<p>A <em>tree state</em> <span class="math inline">\(\tau\)</span> is a finite map from file paths to blob identifiers and modes, the decoded form of a Git root tree. A <em>commit</em> <span class="math inline">\(c\)</span> has a tree state <span class="math inline">\(\tau(c)\)</span> and a list of parents; <span class="math inline">\(\pi_1(c)\)</span> is its first parent, or <span class="math inline">\(\bot\)</span> for a root commit. Every recorded commit also has a <em>generation</em> one greater than the largest generation of its parents, so the parent relation is acyclic.</p>
+<div class="definition">
+<p><strong>Definition 4.2</strong> (Touched paths). <span id="def:tlsc:touched" data-label="def:tlsc:touched"></span> The <em>change</em> of a commit <span class="math inline">\(c\)</span> is the set <span class="math inline">\(\Delta(c)\)</span> of paths whose entry differs between <span class="math inline">\(\tau(c)\)</span> and <span class="math inline">\(\tau(\pi_1(c))\)</span>, with every path of <span class="math inline">\(\tau(c)\)</span> counted when <span class="math inline">\(\pi_1(c)=\bot\)</span>. The platform records with <span class="math inline">\(c\)</span> a set <span class="math inline">\(T(c)\)</span> of <em>touched paths</em>, viewed as file nodes of the location tree of Definition <a href="#def:tlsc:access">4.4</a>; alongside each it stores an operation (add, modify or delete) and the old and new blob, which the results below do not use.</p>
+</div>
+<p>The authority derives <span class="math inline">\(T(c)\)</span> from the change list it was given and builds <span class="math inline">\(\tau(c)\)</span> by applying exactly that list to <span class="math inline">\(\tau(\pi_1(c))\)</span>. Hence <span class="math inline">\(\Delta(c)\subseteq T(c)\)</span> for every commit the platform prepares, including the merge commits the platform builds when landing work on a moved branch: the adapter submits each of them to the same preparation command, with the head as first parent and the merged commits as further parents. A property test checks that the incremental rewrite produces the same tree as building it from scratch.</p>
+<div class="proposition">
+<p><strong>Proposition 4.3</strong> (Rewrite cost). <span id="prop:tlsc:rewrite" data-label="prop:tlsc:rewrite"></span> Let <span class="math inline">\(c\)</span> change the set of paths <span class="math inline">\(P\)</span> relative to <span class="math inline">\(\pi_1(c)\)</span>, and let <span class="math inline">\(D(P)\)</span> be the set of directories that are proper prefixes of some path in <span class="math inline">\(P\)</span>, including the root. Preparing <span class="math inline">\(c\)</span> reads exactly the trees of <span class="math inline">\(D(P)\)</span> that exist in <span class="math inline">\(\tau(\pi_1(c))\)</span> and encodes exactly the trees of <span class="math inline">\(D(P)\)</span> that are non-empty in <span class="math inline">\(\tau(c)\)</span>; a directory left empty is removed from its parent instead. The work is <span class="math inline">\(O\bigl(\sum_{d\in D(P)}|d|\bigr)\)</span>, where <span class="math inline">\(|d|\)</span> is the number of entries of directory <span class="math inline">\(d\)</span> in <span class="math inline">\(\tau(\pi_1(c))\)</span> and <span class="math inline">\(\tau(c)\)</span> together, and is independent of the number of files outside <span class="math inline">\(D(P)\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> A tree’s identifier depends only on its entries. A directory not in <span class="math inline">\(D(P)\)</span> contains no changed path, so its entries and hence its identifier are unchanged, and its parent can reuse the identifier without reading it. A directory in <span class="math inline">\(D(P)\)</span> contains a changed path, so at least one entry changes and the directory must be re-encoded, which requires reading its existing entries. Re-encoding a directory costs time linear in its entries. Summing over <span class="math inline">\(D(P)\)</span> gives the bound. ◻</p>
+</div>
+<p>The bound depends on directory fan-out, so a flat directory of many files makes a one-file change expensive. It does not depend on repository size as such. The unit test <code>rewriting_reads_only_directories_on_changed_paths</code> checks that an unchanged subtree is never read.</p>
+<h3 data-number="4.2" id="locations-and-access-sets"><span class="header-section-number">4.2</span> Locations and access sets</h3>
+<p>Read and write sets name parts of the source at two granularities: files and directory prefixes, and symbols inside files. We model both as nodes of one tree.</p>
+<div class="definition">
+<p><strong>Definition 4.4</strong> (Location tree and overlap). <span id="def:tlsc:access" data-label="def:tlsc:access"></span> The <em>location tree</em> <span class="math inline">\(\mathcal{T}\)</span> is the rooted tree of all syntactically valid locations, whether or not a given tree state contains them. Its nodes are the root, directories, files and symbols; a directory’s children are the directories and files named inside it, a file’s children are its top-level symbols, and a symbol’s children are its nested members. An <em>access</em> is a node of <span class="math inline">\(\mathcal{T}\)</span>. Write <span class="math inline">\(a\sqsubseteq b\)</span> when <span class="math inline">\(a\)</span> is an ancestor of <span class="math inline">\(b\)</span> or equal to it. Two accesses <em>overlap</em>, written <span class="math inline">\(a\bowtie b\)</span>, when <span class="math inline">\(a\sqsubseteq b\)</span> or <span class="math inline">\(b\sqsubseteq a\)</span>. For sets of accesses, <span class="math inline">\(X\bowtie Y\)</span> holds when some <span class="math inline">\(x\in X\)</span> and <span class="math inline">\(y\in Y\)</span> overlap, and <span class="math inline">\(X\not\bowtie Y\)</span> otherwise.</p>
+</div>
+<p>In the implementation, an access is a string: a path such as <code>src/lib.rs</code>, a prefix such as <code>src/</code>, or a symbol entry such as <code>src/lib.rs#Policy::backoff</code>. Two paths overlap when they are equal or when one is a prefix of the other at a component boundary, so <code>src/a</code> and <code>src/ab</code> do not overlap. Two symbol entries overlap when they name the same file and one symbol path is a <code>::</code> prefix of the other. A path and a symbol overlap when the path overlaps the symbol’s file. The code adds one further case, for files whose literal names contain <code>#</code>, which can only add overlaps. The implemented relation therefore contains the relation of Definition <a href="#def:tlsc:access">4.4</a>. Extra overlaps are the safe direction for the soundness results below, which can only gain conflicts and merges.</p>
+<div class="lemma">
+<p><strong>Lemma 4.5</strong> (Overlap). <span id="lem:tlsc:overlap" data-label="lem:tlsc:overlap"></span> Let <span class="math inline">\(\mathrm{sub}(a)=\{x\in\mathcal{T}: a\sqsubseteq x\}\)</span>. Then <span class="math inline">\(a\bowtie b\)</span> if and only if <span class="math inline">\(\mathrm{sub}(a)\cap\mathrm{sub}(b)\neq\varnothing\)</span>. The relation <span class="math inline">\(\bowtie\)</span> is reflexive and symmetric. If <span class="math inline">\(a&#39;\sqsubseteq a\)</span> and <span class="math inline">\(a\bowtie b\)</span>, then <span class="math inline">\(a&#39;\bowtie b\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> If <span class="math inline">\(a\sqsubseteq b\)</span> then <span class="math inline">\(b\)</span> lies in both subtrees, and symmetrically. Conversely, if <span class="math inline">\(x\)</span> lies in both subtrees then <span class="math inline">\(a\)</span> and <span class="math inline">\(b\)</span> are both ancestors of <span class="math inline">\(x\)</span>; the ancestors of a node in a rooted tree form a chain, so <span class="math inline">\(a\)</span> and <span class="math inline">\(b\)</span> are comparable. Reflexivity and symmetry are immediate. For the last claim, <span class="math inline">\(\mathrm{sub}(a)\subseteq\mathrm{sub}(a&#39;)\)</span>, so a common element of <span class="math inline">\(\mathrm{sub}(a)\)</span> and <span class="math inline">\(\mathrm{sub}(b)\)</span> is also in <span class="math inline">\(\mathrm{sub}(a&#39;)\)</span>. ◻</p>
+</div>
+<p>Accesses are granules in the sense of multigranularity locking, where a lock on a node implicitly covers its descendants [<a href="#bib-bhg1987">6</a>, Section 3.9]; overlap is intersection of that implicit coverage. We validate rather than lock, so no intention modes are needed.</p>
+<div class="definition">
+<p><strong>Definition 4.6</strong> (Read and write sets). <span id="def:tlsc:rwsets" data-label="def:tlsc:rwsets"></span> A change carries a <em>declared read set</em> <span class="math inline">\(\mathsf{R}\)</span>, a finite set of accesses supplied by the writer, and a <em>write set</em>. The write set of a recorded commit <span class="math inline">\(c\)</span> is <span class="math inline">\(\mathsf{W}(c)=T(c)\)</span> at path granularity. When the platform has parsed both sides of a touched file and found the symbols the change affected, it may replace that file by those symbols; the result is the <em>refined</em> write set <span class="math inline">\(\mathsf{W}^{\rho}(c)\)</span>. A file the platform could not resolve stays a whole-file write.</p>
+</div>
+<p>A tree state assigns <em>content</em> to file and symbol locations: a file’s content is its blob and mode, a symbol’s content is the source text the parser attributes to it, and a location the state does not contain has content <span class="math inline">\(\bot\)</span>. Directories have no content of their own. Two tree states <span class="math inline">\(\tau,\tau&#39;\)</span> <em>agree on</em> a set of accesses <span class="math inline">\(X\)</span>, written <span class="math inline">\(\tau\equiv_X\tau&#39;\)</span>, when they assign the same content to every file and symbol location in <span class="math inline">\(\bigcup_{x\in X}\mathrm{sub}(x)\)</span>. Because absent locations have content <span class="math inline">\(\bot\)</span>, agreement on a directory prefix includes agreement on which files exist below it. Agreement on a set of paths is decidable from blob identifiers alone.</p>
+<div class="definition">
+<p><strong>Definition 4.7</strong> (Independence). <span id="def:tlsc:independence" data-label="def:tlsc:independence"></span> Two changes <span class="math inline">\(i,j\)</span> with read sets <span class="math inline">\(\mathsf{R}_i,\mathsf{R}_j\)</span> and write sets <span class="math inline">\(\mathsf{W}_i,\mathsf{W}_j\)</span> are <em>independent</em> when <span class="math display">\[\begin{equation}
+\mathsf{W}_i\not\bowtie(\mathsf{R}_j\cup\mathsf{W}_j)\quad\text{and}\quad\mathsf{W}_j\not\bowtie(\mathsf{R}_i\cup\mathsf{W}_i).
+\label{eq:tlsc:independent}
+\end{equation}\]</span></p>
+</div>
+<p>Condition <a href="#eq:tlsc:independent">(1)</a> is Eq. 1 of the companion paper [<a href="#bib-long2026inversion">24</a>], with set intersection replaced by overlap so that a directory prefix and a file inside it count as meeting. The companion paper calls it a conservative candidate-independence condition that is only as good as the declared sets [<a href="#bib-long2026inversion">24</a>]. Section <a href="#sec:tlsc:eq1">6.4</a> makes precise what it guarantees at landing.</p>
+<h3 data-number="4.3" id="the-transaction-log"><span class="header-section-number">4.3</span> The transaction log</h3>
+<div class="definition">
+<p><strong>Definition 4.8</strong> (Log entry). <span id="def:tlsc:entry" data-label="def:tlsc:entry"></span> A <em>log entry</em> is a tuple <span class="math inline">\(e=(v,b,k,r,o,n,\mathsf{W},\mathsf{R},a,t,h)\)</span> with version <span class="math inline">\(v\geq 1\)</span>, base version <span class="math inline">\(b\)</span> with <span class="math inline">\(0\leq b&lt;v\)</span>, kind <span class="math inline">\(k\in\{\mathrm{commit},\mathrm{merge},\mathrm{revert},\mathrm{import},\mathrm{ref\_move},\mathrm{ref\_delete}\}\)</span>, fully qualified ref name <span class="math inline">\(r\)</span>, old and new values <span class="math inline">\(o,n\in\mathit{Id}\cup\{\bot\}\)</span>, touched paths <span class="math inline">\(\mathsf{W}\)</span> in which no path appears twice, read set <span class="math inline">\(\mathsf{R}\)</span>, actor <span class="math inline">\(a\)</span>, commit time <span class="math inline">\(t\)</span> and chain digest <span class="math inline">\(h\)</span>. Only <span class="math inline">\(\mathrm{ref\_delete}\)</span> has <span class="math inline">\(n=\bot\)</span>.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 4.9</strong> (Hash chain). <span id="def:tlsc:chain" data-label="def:tlsc:chain"></span> Let <span class="math inline">\(h_0\)</span> be the empty string and let <span class="math inline">\(\langle e\rangle\)</span> be the canonical encoding of <span class="math inline">\(e\)</span> without its digest. The chain digest of entry <span class="math inline">\(e_v\)</span> is <span class="math inline">\(h_v=G(h_{v-1},\langle e_v\rangle)\)</span>, where <span class="math inline">\(G\)</span> is SHA-256 over a canonical encoding of the pair.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 4.10</strong> (Log and well-formedness). <span id="def:tlsc:log" data-label="def:tlsc:log"></span> A <em>log</em> is a finite sequence <span class="math inline">\(\mathcal{L}=(e_1,\dots,e_n)\)</span>. It is <em>well formed</em> when (I1) <span class="math inline">\(e_v\)</span> has version <span class="math inline">\(v\)</span> for every <span class="math inline">\(v\)</span>; (I2) every <span class="math inline">\(h_v\)</span> equals <span class="math inline">\(G(h_{v-1},\langle e_v\rangle)\)</span>; and (I3) for every <span class="math inline">\(v\)</span>, the old value <span class="math inline">\(o_v\)</span> equals the value of ref <span class="math inline">\(r_v\)</span> after replaying <span class="math inline">\(e_1,\dots,e_{v-1}\)</span>. The <em>current version</em> of <span class="math inline">\(\mathcal{L}\)</span> is <span class="math inline">\(n\)</span>.</p>
+</div>
+<p>The labels I1 to I3 match the invariant list in Table <a href="#tab:tlsc:invariants">3</a>. In the implementation, the log is a SQLite table keyed by version. The touched paths are copied into each entry from the commit’s recorded paths at the moment of appending, so an entry is self-contained: validation never needs to consult commit metadata.</p>
+<h3 data-number="4.4" id="snapshots-replay-and-checkpoints"><span class="header-section-number">4.4</span> Snapshots, replay and checkpoints</h3>
+<div class="definition">
+<p><strong>Definition 4.11</strong> (Snapshot and replay). <span id="def:tlsc:snapshot" data-label="def:tlsc:snapshot"></span> A <em>snapshot</em> is a finite map <span class="math inline">\(S:\mathit{Ref}\rightharpoonup\mathit{Id}\)</span>. Replay applies an entry to a snapshot: <span class="math inline">\(\mathrm{apply}(S,e)\)</span> removes <span class="math inline">\(r\)</span> when <span class="math inline">\(n=\bot\)</span> and otherwise sets <span class="math inline">\(r\)</span> to <span class="math inline">\(n\)</span>. For a well-formed log, <span class="math inline">\(S_{0}=\varnothing\)</span> and <span class="math inline">\(S_{v}=\mathrm{apply}(S_{v-1},e_v)\)</span>. We call <span class="math inline">\(S_{v}\)</span> the snapshot at version <span class="math inline">\(v\)</span>.</p>
+</div>
+<div class="definition">
+<p><strong>Definition 4.12</strong> (Checkpoint). <span id="def:tlsc:checkpoint" data-label="def:tlsc:checkpoint"></span> A <em>checkpoint</em> is a triple <span class="math inline">\(K=(u,S,h)\)</span> claiming that the snapshot at version <span class="math inline">\(u\)</span> is <span class="math inline">\(S\)</span> and that the chain digest at <span class="math inline">\(u\)</span> is <span class="math inline">\(h\)</span>. The implementation writes one in the same transaction as every entry whose version is a multiple of 64, stores it in the authority’s database, and accepts it for a read only when <span class="math inline">\(h\)</span> equals the digest stored in the log at version <span class="math inline">\(u\)</span>.</p>
+</div>
+<p>The replay function of the implementation takes a starting checkpoint and a tail of entries. For each entry it checks that the version is the next one, that the entry is internally valid, that the recomputed chain digest matches, and that the entry’s old value equals the ref’s current value in the state being built; any failure aborts the read with an integrity error. This is the executable form of well-formedness.</p>
+<div class="definition">
+<p><strong>Definition 4.13</strong> (Time travel). <span id="def:tlsc:timetravel" data-label="def:tlsc:timetravel"></span> A <em>read at version</em> <span class="math inline">\(u\)</span>, for <span class="math inline">\(0\leq u\leq n\)</span>, returns <span class="math inline">\(S_{u}\)</span> computed by replay from the latest accepted checkpoint at or before <span class="math inline">\(u\)</span>. A <em>read at commit</em> <span class="math inline">\(x\)</span> returns objects reachable from <span class="math inline">\(x\)</span>. A read without a version uses the ref table of the current state.</p>
+</div>
+<p>Time travel works by log version and by commit identifier. A read by timestamp is not implemented: the entries carry commit times, so a timestamp could be mapped to the last version committed before it, but the read path does not do so at the commit we describe.</p>
+<h3 data-number="4.5" id="the-authority-and-its-commands"><span class="header-section-number">4.5</span> The authority and its commands</h3>
+<div class="assumption">
+<p><strong>Assumption 4.14</strong> (Serialized authority). <span id="ass:tlsc:atomic" data-label="ass:tlsc:atomic"></span> The authority’s command executions are equivalent to some sequential order of those executions. Each command runs inside one storage transaction that either commits all of its writes or none of them, and a command that returns an error commits none. No command performs network input or output inside its transaction.</p>
+</div>
+<p>Assumption <a href="#ass:tlsc:atomic">4.14</a> is the only property of the execution platform that the proofs use. Under it, the history of the authority’s database is a sequence of committed command executions, and each command is a function from one database state to the next. The authority is then a state machine in Schneider’s sense, whose deterministic commands each execute atomically with respect to the others [<a href="#bib-schneider1990">30</a>]. For the log, the assumption gives the contract Delta Lake states for catalog-managed tables: a catalog “must not ratify version <span class="math inline">\(v\)</span> until it has ratified version <span class="math inline">\(v-1\)</span>, and it must ratify version <span class="math inline">\(v\)</span> at most once” [<a href="#bib-deltaprotocol">15</a>].</p>
+<p>Many stores satisfy the assumption. Any store with serializable, all-or-nothing transactions over the authority’s state does. A weaker store suffices for the log alone: if appending version <span class="math inline">\(n+1\)</span> is a put-if-absent and every command re-reads the log tail it validates against, Delta’s argument applies [<a href="#bib-armbrust2020delta">3</a>].</p>
+<p>The reference implementation satisfies it with a Durable Object, which processes one request at a time and whose synchronous transaction API is all-or-nothing [<a href="#bib-cfdoconcepts">8</a>, <a href="#bib-cfdosqlite">9</a>]. The authority’s dispatcher wraps every command in that API and turns any error into a rollback, and the authority’s crate calls only its SQL store interface (Appendix <a href="#app:tlsc:evidence">A</a>).</p>
+<div class="definition">
+<p><strong>Definition 4.15</strong> (Proposal and validation). <span id="def:tlsc:validation" data-label="def:tlsc:validation"></span> A <em>proposal</em> to land commit <span class="math inline">\(c\)</span> on ref <span class="math inline">\(r\)</span> is <span class="math inline">\(P=(r,b,\pi_1(c),\mathsf{W}(c),\mathsf{R})\)</span>, where <span class="math inline">\(b\)</span> is the base version recorded with <span class="math inline">\(c\)</span>. Against a log of current version <span class="math inline">\(n\)</span>, let <span class="math inline">\(\mathrm{Later}(P)=(e_v : b&lt;v\leq n,\ r_v=r)\)</span>. An entry <span class="math inline">\(e_v\)</span> is <em>opaque</em> when its touched path list is empty and its kind is neither commit nor merge. <em>Validation</em> returns</p>
+<ol>
+<li><p><span class="math inline">\(\mathrm{Conflict}(v)\)</span> for the first <span class="math inline">\(e_v\in\mathrm{Later}(P)\)</span> that is opaque or satisfies <span class="math inline">\(\mathsf{R}\bowtie\mathsf{W}^{\rho}_v\)</span>;</p></li>
+<li><p>otherwise <span class="math inline">\(\mathrm{FastForward}\)</span> if <span class="math inline">\(\mathrm{Later}(P)\)</span> is empty;</p></li>
+<li><p>otherwise <span class="math inline">\(\mathrm{Rebase}\)</span> if <span class="math inline">\(\mathsf{W}(c)\not\bowtie\mathsf{W}_v\)</span> for every <span class="math inline">\(e_v\in\mathrm{Later}(P)\)</span>;</p></li>
+<li><p>otherwise <span class="math inline">\(\mathrm{Merge}\)</span> with the overlapping paths.</p></li>
+</ol>
+</div>
+<p>The four outcomes are those of the function <code>Proposal::check</code> in the implementation. Two details are worth stating because they decide what the theorems can claim. The stale-read test uses the later entries’ refined writes, so a read of one symbol is not invalidated by a later change to another symbol of the same file. The write-overlap test that separates Rebase from Merge works at path granularity only.</p>
+<div class="definition">
+<p><strong>Definition 4.16</strong> (Atomic append). <span id="def:tlsc:append" data-label="def:tlsc:append"></span> Appending commit <span class="math inline">\(c\)</span> to ref <span class="math inline">\(r\)</span> with kind <span class="math inline">\(k\)</span> and old value <span class="math inline">\(o\)</span>, in a state with current version <span class="math inline">\(n\)</span>, writes in one transaction: the entry <span class="math inline">\(e_{n+1}\)</span> with ref <span class="math inline">\(r_{n+1}=r\)</span>, old value <span class="math inline">\(o_{n+1}=o\)</span>, new value <span class="math inline">\(n_{n+1}=c\)</span>, touched paths <span class="math inline">\(T(c)\)</span>, the commit’s recorded read set and base (the base capped at <span class="math inline">\(n\)</span>), the landing principal as actor, the authority’s clock as time, and digest <span class="math inline">\(h_{n+1}\)</span>; the new value of <span class="math inline">\(r\)</span> in the ref table; the projection target for the object store; a checkpoint if <span class="math inline">\(64\)</span> divides <span class="math inline">\(n+1\)</span>; and one row of the landings table recording that <span class="math inline">\(c\)</span> landed on <span class="math inline">\(r\)</span> at version <span class="math inline">\(n+1\)</span>.</p>
+</div>
+<p>When the appended commit is a platform merge landing one commit, the entry takes the merged commit’s read set and base; when it lands a batch, it takes the union of the members’ read sets and the smallest member base (Definition <a href="#def:tlsc:combiner">7.1</a>).</p>
+<h2 data-number="5" id="sec:tlsc:log"><span class="header-section-number">5</span> Properties of the log</h2>
+<h3 data-number="5.1" id="replay-and-checkpoints"><span class="header-section-number">5.1</span> Replay and checkpoints</h3>
+<p>The first half of the next theorem is the state-machine property: replicas that process the same sequence of requests reach the same state [<a href="#bib-schneider1990">30</a>]. Delta Lake computes a snapshot the same way, by replaying committed actions in ascending version order from a checkpoint no newer than the requested version [<a href="#bib-deltaprotocol">15</a>].</p>
+<div class="theorem">
+<p><strong>Theorem 5.1</strong> (Replay determinism). <span id="thm:tlsc:replay" data-label="thm:tlsc:replay"></span> Let <span class="math inline">\(\mathcal{L}\)</span> be well formed with current version <span class="math inline">\(n\)</span>, and let <span class="math inline">\(K=(u,S_{u},h_u)\)</span> be the true checkpoint at some <span class="math inline">\(u\leq v\leq n\)</span>. Replaying <span class="math inline">\(e_{u+1},\dots,e_v\)</span> from <span class="math inline">\(K\)</span> succeeds and returns <span class="math inline">\((v,S_{v},h_v)\)</span>. Replaying the same tail from any <span class="math inline">\(K&#39;=(u,S&#39;,h_u)\)</span> with <span class="math inline">\(S&#39;\neq S_{u}\)</span> either fails or returns a snapshot that differs from <span class="math inline">\(S_{v}\)</span> only on refs that no entry of the tail touches.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> For the first claim, induct on <span class="math inline">\(v-u\)</span>. The case <span class="math inline">\(v=u\)</span> is the checkpoint itself. For the step, the replay state before <span class="math inline">\(e_{w+1}\)</span> is <span class="math inline">\((w,S_{w},h_w)\)</span> by hypothesis. The version check passes by I1, the digest check passes by I2, and the old-value check passes by I3 because the state’s value of <span class="math inline">\(r_{w+1}\)</span> is <span class="math inline">\(S_{w}(r_{w+1})=o_{w+1}\)</span>. Applying the entry gives <span class="math inline">\(S_{w+1}\)</span> and digest <span class="math inline">\(h_{w+1}\)</span>. The induction is the state-machine argument made concrete: each step uses one of the implementation’s three validity conditions.</p>
+<p>For the second claim, suppose replay from <span class="math inline">\(K&#39;\)</span> succeeds. Each step sets or removes exactly the ref it names, and the digest checks do not depend on the snapshot component. Let <span class="math inline">\(D=\{x : S&#39;(x)\neq S_{u}(x)\}\)</span>. A ref in <span class="math inline">\(D\)</span> that some tail entry touches is checked at its first touch: the old-value check compares <span class="math inline">\(S&#39;(x)\)</span> with <span class="math inline">\(o_w=S_{w-1}(x)=S_{u}(x)\)</span>, because no earlier tail entry touched <span class="math inline">\(x\)</span>, and so fails. Since replay succeeded, no tail entry touches a ref in <span class="math inline">\(D\)</span>, and the replayed states agree with <span class="math inline">\(S_{w}\)</span> outside <span class="math inline">\(D\)</span> and with <span class="math inline">\(S&#39;\)</span> on <span class="math inline">\(D\)</span>. ◻</p>
+</div>
+<p>The second half of Theorem <a href="#thm:tlsc:replay">5.1</a> is a limit, not a guarantee. The implementation accepts a checkpoint when its chain digest matches the log, and the digest binds the checkpoint to a position in the log but not to its ref map. A checkpoint whose ref map was altered while its digest was kept is detected only when the altered ref is touched again before the requested version. Delta Lake faces the same issue and specifies the remedy: a version checksum records metrics of the table state, and readers validate a reconstructed state by recomputing those metrics and comparing them with the checksum [<a href="#bib-deltaprotocol">15</a>]. Storing a digest of the ref map with each checkpoint and in the next log entry would be the counterpart here. It is not implemented, and no test exercises a corrupted checkpoint with a correct digest.</p>
+<div class="proposition">
+<p><strong>Proposition 5.2</strong> (Tamper evidence relative to a trusted digest). <span id="prop:tlsc:tamper" data-label="prop:tlsc:tamper"></span> Let a reader hold a trusted digest <span class="math inline">\(h^{*}_w\)</span> for version <span class="math inline">\(w\)</span>. If any entry <span class="math inline">\(e_u\)</span> with <span class="math inline">\(u\leq w\)</span> is replaced by <span class="math inline">\(e&#39;_u\neq e_u\)</span> while the stored log still validates up to <span class="math inline">\(w\)</span> against <span class="math inline">\(h^{*}_w\)</span>, then <span class="math inline">\(G\)</span> has a collision.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Let <span class="math inline">\(h&#39;_v\)</span> be the digests of the altered log. Validation to <span class="math inline">\(w\)</span> means <span class="math inline">\(h&#39;_w=h^{*}_w=h_w\)</span>. Take the largest <span class="math inline">\(v\leq w\)</span> at which the inputs to <span class="math inline">\(G\)</span> differ, which exists because <span class="math inline">\(\langle e&#39;_u\rangle\neq\langle e_u\rangle\)</span>. Above <span class="math inline">\(v\)</span> the inputs agree, so the outputs agree down to <span class="math inline">\(v\)</span>, and <span class="math inline">\(G(h&#39;_{v-1},\langle e&#39;_v\rangle)=G(h_{v-1},\langle e_v\rangle)\)</span> with distinct inputs. ◻</p>
+</div>
+<p>The chain is tamper-evident only relative to a digest held outside the altered region. The implementation stores the digest both in the entry and in its own column, and checkpoints repeat it, so a careless edit of one entry is detected on the next replay; the test <code>tampered_history_is_detected_on_time_travel</code> edits an entry in place and observes an integrity error on a read at that version. An adversary with write access to the authority’s database can recompute every digest and every checkpoint. Defending against that adversary would require publishing digests elsewhere, which the platform does not do. Crosby and Wallach make the general point: a hash-chained log is tamper-evident only against commitments that auditors hold, and an unaudited logger can present inconsistent histories [<a href="#bib-crosby2009">11</a>]. The chain is therefore an integrity check against accidental or careless modification, not an audit mechanism.</p>
+<h3 data-number="5.2" id="refs-only-advance"><span class="header-section-number">5.2</span> Refs only advance</h3>
+<div class="lemma">
+<p><strong>Lemma 5.3</strong> (Append discipline). <span id="lem:tlsc:append" data-label="lem:tlsc:append"></span> At commit <code>cfa4845</code>, every code path that appends an entry <span class="math inline">\(e_v\)</span> satisfies <span class="math inline">\(o_v=S_{v-1}(r_v)\)</span>, uses one of the kinds commit, merge, revert or import, and satisfies one of the following: (a) <span class="math inline">\(S_{v-1}(r_v)=\bot\)</span>; or (b) <span class="math inline">\(\pi_1(n_v)=S_{v-1}(r_v)\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> The append function has seven call sites. The direct land with no current head appends a commit with <span class="math inline">\(o=\bot\)</span>, which is case (a); import is allowed only when the repository has no refs, also case (a). The direct land of a commit whose first parent is the head appends with <span class="math inline">\(o\)</span> equal to the head, case (b). The direct land of a platform merge first verifies that the merge’s parents are exactly the head followed by the merged commit, case (b). The land combiner appends either a single commit after checking that its first parent is the head, or an octopus merge after checking that its parents are exactly the head followed by the landed commits, both case (b). The break-glass path refuses any commit whose first parent is not the current head, case (a) or (b). In every case <span class="math inline">\(o\)</span> is the value read from the ref table in the same transaction, which is <span class="math inline">\(S_{v-1}(r_v)\)</span> by Assumption <a href="#ass:tlsc:atomic">4.14</a>. No call site appends the kinds ref move or ref delete, although the log format allows them. ◻</p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 5.4</strong> (Refs advance along first-parent chains). <span id="thm:tlsc:forward" data-label="thm:tlsc:forward"></span> Let <span class="math inline">\(u\leq v\)</span>. If <span class="math inline">\(S_{u}(r)=x\neq\bot\)</span>, then <span class="math inline">\(S_{v}(r)\)</span> is defined and <span class="math inline">\(x\)</span> is reached from <span class="math inline">\(S_{v}(r)\)</span> by following first parents. If <span class="math inline">\(S_{u}(r)=S_{v}(r)\)</span>, including the case where both are <span class="math inline">\(\bot\)</span>, then no entry with version in <span class="math inline">\((u,v]\)</span> names <span class="math inline">\(r\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Induct on <span class="math inline">\(v-u\)</span>. If <span class="math inline">\(e_{v}\)</span> does not name <span class="math inline">\(r\)</span> the value is unchanged. If it does, Lemma <a href="#lem:tlsc:append">5.3</a> gives <span class="math inline">\(o_v=S_{v-1}(r)\neq\bot\)</span>, so case (b) applies and <span class="math inline">\(\pi_1(S_{v}(r))=S_{v-1}(r)\)</span>; no entry deletes a ref, so the value stays defined. Composing first-parent steps gives the first claim. For the second, every entry naming <span class="math inline">\(r\)</span> sets it to a commit, so once named, <span class="math inline">\(r\)</span> stays defined. If both values are <span class="math inline">\(\bot\)</span>, no entry in <span class="math inline">\((u,v]\)</span> can therefore name <span class="math inline">\(r\)</span>. Otherwise <span class="math inline">\(S_{u}(r)\neq\bot\)</span>, every entry naming <span class="math inline">\(r\)</span> in <span class="math inline">\((u,v]\)</span> adds one first-parent step, and each step strictly increases generation, so the generation of <span class="math inline">\(S_{v}(r)\)</span> exceeds that of <span class="math inline">\(S_{u}(r)\)</span> whenever at least one such entry exists. ◻</p>
+</div>
+<div class="corollary">
+<p><strong>Corollary 5.5</strong> (No lost update). <span id="cor:tlsc:nolostupdate" data-label="cor:tlsc:nolostupdate"></span> If commit <span class="math inline">\(c\)</span> landed on <span class="math inline">\(r\)</span> at version <span class="math inline">\(u\)</span>, then for every <span class="math inline">\(v\geq u\)</span>, <span class="math inline">\(c\)</span> is an ancestor of <span class="math inline">\(S_{v}(r)\)</span>. In particular no landing overwrites another, and every landed commit stays reachable from the branch it landed on.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Landing <span class="math inline">\(c\)</span> at <span class="math inline">\(u\)</span> means either <span class="math inline">\(S_{u}(r)=c\)</span>, or <span class="math inline">\(S_{u}(r)\)</span> is a platform merge with <span class="math inline">\(c\)</span> among its parents. Either way <span class="math inline">\(c\)</span> is an ancestor of <span class="math inline">\(S_{u}(r)\)</span>, which is a first-parent ancestor of <span class="math inline">\(S_{v}(r)\)</span> by Theorem <a href="#thm:tlsc:forward">5.4</a>. ◻</p>
+</div>
+<p>Corollary <a href="#cor:tlsc:nolostupdate">5.5</a> says that the history of a ref exhibits no lost update, phenomenon P4 of Berenson and colleagues [<a href="#bib-berenson1995critique">4</a>]. On the ref item, the compare-and-swap plays the role of their first-committer-wins rule: a writer whose commit was built on a stale head cannot replace the head, because the fast-forward path requires the first parent to equal the current value, and must go through validation and a merge instead. Files are handled differently (Section <a href="#sec:tlsc:isolation">6.3</a>).</p>
+<p>Refs are never rewritten. Undoing a landed change is itself a new commit: post-land repair proposes a revert commit, and break-glass lands only fast-forwards.</p>
+<p>Theorem <a href="#thm:tlsc:forward">5.4</a> is a property of the code at the stated commit, not of the log format, which reserves kinds for ref moves and deletions. If an owner-reset operation were added, the theorem would hold only between resets; validation already treats such entries as opaque.</p>
+<h3 data-number="5.3" id="snapshot-immutability"><span class="header-section-number">5.3</span> Snapshot immutability</h3>
+<div class="theorem">
+<p><strong>Theorem 5.6</strong> (Snapshot immutability). <span id="thm:tlsc:snapshot-immutability" data-label="thm:tlsc:snapshot-immutability"></span> Let <span class="math inline">\(\mathcal{L}\)</span> have current version <span class="math inline">\(n\)</span> and let <span class="math inline">\(\mathcal{L}&#39;\)</span> be the log at any later time, with current version <span class="math inline">\(n&#39;\geq n\)</span>. For every <span class="math inline">\(u\leq n\)</span>, the snapshot at version <span class="math inline">\(u\)</span> computed from <span class="math inline">\(\mathcal{L}&#39;\)</span> equals the snapshot at version <span class="math inline">\(u\)</span> computed from <span class="math inline">\(\mathcal{L}\)</span>. For every ref <span class="math inline">\(r\)</span> with <span class="math inline">\(S_{u}(r)=x\)</span>, the tree <span class="math inline">\(\tau(x)\)</span> and every object reachable from it are the same at both times, if they are present.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> The authority only inserts log rows, keyed by version; no code path updates or deletes a log row, and an insert at an existing version fails. Hence <span class="math inline">\(\mathcal{L}\)</span> is a prefix of <span class="math inline">\(\mathcal{L}&#39;\)</span>. <span class="math inline">\(S_{u}\)</span> depends only on <span class="math inline">\(e_1,\dots,e_u\)</span> (Definition <a href="#def:tlsc:snapshot">4.11</a>), and replay from any accepted true checkpoint returns the same value (Theorem <a href="#thm:tlsc:replay">5.1</a>). The second claim follows from content addressing (Definition <a href="#def:tlsc:objects">4.1</a>): an identifier determines its bytes. ◻</p>
+</div>
+<p>A read pinned at version <span class="math inline">\(u\)</span> therefore has snapshot semantics in the strongest sense: it is a pure function of <span class="math inline">\(u\)</span>, it takes no lock, and it does not contend with landings beyond sharing the authority’s single thread for the duration of one read command. In the terms of Bernstein, Hadzilacos and Goodman, a read pinned at <span class="math inline">\(u\)</span> is a query of the multiversion mixed method with timestamp <span class="math inline">\(u\)</span>: it reads the latest version older than its timestamp, written by a committed transaction, so no later write can invalidate it [<a href="#bib-bhg1987">6</a>, Section 5.5]. Delta Lake makes the same observation about its snapshot reads, which create no contention because they only read immutable objects [<a href="#bib-armbrust2020delta">3</a>].</p>
+<p>Theorem <a href="#thm:tlsc:snapshot-immutability">5.6</a> says that objects are unchanged if they are present. Presence needs its own assumption, because the object store is a separate system that may collect unreachable objects.</p>
+<div class="assumption">
+<p><strong>Assumption 5.7</strong> (Retention). <span id="ass:tlsc:retention" data-label="ass:tlsc:retention"></span> The object store keeps every object reachable from the current value of some ref.</p>
+</div>
+<div class="corollary">
+<p><strong>Corollary 5.8</strong> (Readable snapshots). <span id="cor:tlsc:readable" data-label="cor:tlsc:readable"></span> Under Assumption <a href="#ass:tlsc:retention">5.7</a>, for every <span class="math inline">\(u\leq n\)</span> and every ref <span class="math inline">\(r\)</span> that is defined in both <span class="math inline">\(S_{u}\)</span> and <span class="math inline">\(S_{n}\)</span>, every object reachable from <span class="math inline">\(S_{u}(r)\)</span> is present.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> By Theorem <a href="#thm:tlsc:forward">5.4</a>, <span class="math inline">\(S_{u}(r)\)</span> is a first-parent ancestor of <span class="math inline">\(S_{n}(r)\)</span>, so everything reachable from it is reachable from the current value of <span class="math inline">\(r\)</span>. ◻</p>
+</div>
+<p>Since no implemented operation deletes a ref (Lemma <a href="#lem:tlsc:append">5.3</a>), every ref defined at <span class="math inline">\(u\)</span> is defined at <span class="math inline">\(n\)</span>, and Corollary <a href="#cor:tlsc:readable">5.8</a> covers every pinned read. Assumption <a href="#ass:tlsc:retention">5.7</a> is the only property the object store must provide. The platform’s procedure for releasing hidden refs is designed to preserve it, and Part II gives that argument in its Proposition 12.1; nothing in this paper depends on that procedure beyond the assumption.</p>
+<h3 data-number="5.4" id="sec:tlsc:delta"><span class="header-section-number">5.4</span> Relation to the Delta log</h3>
+<p>The structure matches Delta Lake’s closely, and Table <a href="#tab:tlsc:delta">2</a> lists the correspondence. Delta names log records by contiguous version numbers, requires that writers never overwrite an existing log entry, and reconstructs any version by replaying actions from a checkpoint [<a href="#bib-deltaprotocol">15</a>, <a href="#bib-armbrust2020delta">3</a>]. Its write protocol reads at version <span class="math inline">\(r\)</span> and then attempts to create record <span class="math inline">\(r+1\)</span> atomically, and its paper concludes that writes are serializable in increasing order of record identifiers because only one transaction can create each record [<a href="#bib-armbrust2020delta">3</a>]. That argument covers the ordering of commits. Whether a transaction that retries at a later version is still correct depends on conflict checks, which the paper does not specify and the implementation does: a committing transaction is checked against each concurrently committed one for added files that match its read predicates, deleted files it read, and files both deleted [<a href="#bib-deltaconflictsrc">12</a>, <a href="#bib-deltadocscc">13</a>].</p>
+<table id="tab:tlsc:delta">
+<caption>Correspondence with the Delta Lake log. Delta’s column cites its protocol, paper and implementation as noted in the text.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Concept</th>
+<th style="text-align: left;">Delta Lake</th>
+<th style="text-align: left;">This model</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Unit of state</td>
+<td style="text-align: left;">A set of data files per table</td>
+<td style="text-align: left;">A map from refs to commits per repository</td>
+</tr>
+<tr>
+<td style="text-align: left;">Log record</td>
+<td style="text-align: left;">A set of actions for version <span class="math inline">\(v\)</span>, never overwritten</td>
+<td style="text-align: left;">One ref move with its touched paths, inserted at version <span class="math inline">\(v\)</span> only</td>
+</tr>
+<tr>
+<td style="text-align: left;">Atomic step</td>
+<td style="text-align: left;">Put-if-absent, atomic rename, or a catalog that ratifies each version once and in order</td>
+<td style="text-align: left;">One command of the serialized authority</td>
+</tr>
+<tr>
+<td style="text-align: left;">Checkpoint</td>
+<td style="text-align: left;">Written by any client, by default every 10 commits</td>
+<td style="text-align: left;">Written by the authority in the same command as the entry, every 64 versions</td>
+</tr>
+<tr>
+<td style="text-align: left;">State validation</td>
+<td style="text-align: left;">A version checksum compared with the replayed state</td>
+<td style="text-align: left;">A hash chain over entries, with no check of a checkpoint’s ref map</td>
+</tr>
+<tr>
+<td style="text-align: left;">Read set</td>
+<td style="text-align: left;">Read predicates and files, recorded by the engine</td>
+<td style="text-align: left;">Declared by the writer, at path or symbol granularity</td>
+</tr>
+<tr>
+<td style="text-align: left;">Overlapping writes</td>
+<td style="text-align: left;">A conflict, for example two deletions of one file</td>
+<td style="text-align: left;">A three-way merge when the line merge is clean</td>
+</tr>
+<tr>
+<td style="text-align: left;">Time travel</td>
+<td style="text-align: left;">By version or by timestamp</td>
+<td style="text-align: left;">By version or by commit</td>
+</tr>
+<tr>
+<td style="text-align: left;">Retention</td>
+<td style="text-align: left;">Removed files kept for a period, by default 7 days</td>
+<td style="text-align: left;">Objects kept while reachable from a ref</td>
+</tr>
+</tbody>
+</table>
+<p>Validation in this model is closest to Delta’s Serializable isolation level, under which reads and writes behave as if executed one by one, with read predicates supplied by the writer instead of recorded by the engine [<a href="#bib-deltaisolationsrc">14</a>]. It is not Delta’s default WriteSerializable level, which orders only the writes and lets an update commit past a concurrent insert it should have read, as if the update had run first [<a href="#bib-deltaisolationsrc">14</a>]. The authority never reorders: the serial order is always the log order, and a landing whose declared reads meet a later write is refused. It also departs from all three of Delta’s levels, including the internal SnapshotIsolation level, on overlapping writes, which Delta fails and this model merges.</p>
+<p>The atomic step is cheaper here than in Delta. It is a command of the serialized authority, not a conditional write to an object store; in the reference implementation that is one round trip to a Durable Object rather than a storage write with tens to hundreds of milliseconds of latency. Delta’s paper attributes its limit of several write transactions per second to that latency and suggests a low-latency coordinator as the remedy [<a href="#bib-armbrust2020delta">3</a>].</p>
+<p>The log is also smaller. It records only ref changes, so a checkpoint is a map of refs, and commits that have not landed are durable but outside the log; that is what lets commit creation proceed without touching it.</p>
+<p>Like Delta, which supports transactions within one table only [<a href="#bib-armbrust2020delta">3</a>], the model gives no atomicity across refs or repositories.</p>
+<h2 data-number="6" id="sec:tlsc:occ"><span class="header-section-number">6</span> Concurrency control</h2>
+<h3 data-number="6.1" id="validation-against-committed-entries"><span class="header-section-number">6.1</span> Validation against committed entries</h3>
+<p>Landing uses optimistic concurrency. A change is built against a base version without any lock. At landing, the authority compares it with the entries that were appended to the same ref after its base, which is validation against transactions that have already committed; the literature calls this backward validation (see [<a href="#bib-harder1984occ">20</a>]). The comparison and the append happen in one command, so no entry can slip between them.</p>
+<div class="assumption">
+<p><strong>Assumption 6.1</strong> (Consistent base). <span id="ass:tlsc:base" data-label="ass:tlsc:base"></span> A commit <span class="math inline">\(c\)</span> landed on <span class="math inline">\(r\)</span> has a base <span class="math inline">\(b\)</span> with <span class="math inline">\(\pi_1(c)=S_{b}(r)\)</span>, and the writer’s reads were taken from <span class="math inline">\(\tau(\pi_1(c))\)</span>.</p>
+</div>
+<div class="assumption">
+<p><strong>Assumption 6.2</strong> (Sound refinement). <span id="ass:tlsc:refine" data-label="ass:tlsc:refine"></span> For every entry <span class="math inline">\(e_v\)</span>, every location whose content differs between <span class="math inline">\(\tau(S_{v-1}(r_v))\)</span> and <span class="math inline">\(\tau(S_{v}(r_v))\)</span> lies in <span class="math inline">\(\mathrm{sub}(w)\)</span> for some <span class="math inline">\(w\in\mathsf{W}^{\rho}_v\)</span>.</p>
+</div>
+<p>The adapter satisfies Assumption <a href="#ass:tlsc:base">6.1</a> when a writer names a branch: it reads the branch’s snapshot once and passes both the head and the version. A writer may instead pass a parent and a base version of its own choosing, and the authority checks only that the base is not newer than the log. A base that is older than the parent is harmless, because validation then checks more entries than it needs to. A base that is newer than the parent’s version would let validation skip entries that the writer never saw. Requiring <span class="math inline">\(\pi_1(c)=S_{b}(r_c)\)</span> at landing, or deriving <span class="math inline">\(b\)</span> from the version at which the parent landed, would close the gap; neither is implemented.</p>
+<p>One consequence one might fear does not occur. A writer that claims the current version as its base while naming an old parent makes <span class="math inline">\(\mathrm{Later}(P)\)</span> empty, so validation returns FastForward. Both merge paths refuse that outcome: single-merge verification accepts only Rebase or Merge, and batch verification accepts FastForward only when the commit’s first parent is the head (Appendix <a href="#app:tlsc:evidence">A</a>). The exposure is limited to a base that lies strictly between the parent’s version and the head, which makes validation skip the entries in between.</p>
+<p>Assumption <a href="#ass:tlsc:refine">6.2</a> holds at path granularity for every entry whose commit the authority prepared, including platform merge commits, by Lemma <a href="#lem:tlsc:append">5.3</a> and the inclusion <span class="math inline">\(\Delta(c)\subseteq T(c)\)</span>: the first parent of every new value is the old value, so the content of a ref changes exactly on the change of the new commit. Import entries are the exception, because imported history is recorded by the import code rather than prepared; they occur only when a repository is empty. At symbol granularity it is a claim about the parser that derives symbol touches, which treats an edit outside any symbol, and any file it cannot parse, as a whole-file write.</p>
+<div class="lemma">
+<p><strong>Lemma 6.3</strong> (Frame). <span id="lem:tlsc:frame" data-label="lem:tlsc:frame"></span> Under Assumption <a href="#ass:tlsc:refine">6.2</a>, for any set of accesses <span class="math inline">\(X\)</span> and any versions <span class="math inline">\(b\leq v\)</span>, if <span class="math inline">\(X\not\bowtie\mathsf{W}^{\rho}_u\)</span> for every entry <span class="math inline">\(e_u\)</span> with <span class="math inline">\(b&lt;u\leq v\)</span> and <span class="math inline">\(r_u=r\)</span>, then <span class="math inline">\(\tau(S_{b}(r))\equiv_X\tau(S_{v}(r))\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Entries on other refs do not change the value of <span class="math inline">\(r\)</span>. For an entry <span class="math inline">\(e_u\)</span> on <span class="math inline">\(r\)</span>, a location in <span class="math inline">\(\mathrm{sub}(x)\)</span> for <span class="math inline">\(x\in X\)</span> whose content changed would lie in <span class="math inline">\(\mathrm{sub}(w)\)</span> for some <span class="math inline">\(w\in\mathsf{W}^{\rho}_u\)</span>, so <span class="math inline">\(\mathrm{sub}(x)\cap\mathrm{sub}(w)\neq\varnothing\)</span> and <span class="math inline">\(x\bowtie w\)</span> by Lemma <a href="#lem:tlsc:overlap">4.5</a>, contrary to hypothesis. Agreement is transitive, so it holds across all of <span class="math inline">\((b,v]\)</span>, and it holds trivially when <span class="math inline">\(b=v\)</span>. ◻</p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 6.4</strong> (Serializability relative to declared reads). <span id="thm:tlsc:serializability" data-label="thm:tlsc:serializability"></span> Fix a version <span class="math inline">\(v_0\)</span> and let <span class="math inline">\(e_{v_1},\dots,e_{v_m}\)</span>, with <span class="math inline">\(v_0&lt;v_1&lt;\cdots&lt;v_m\)</span>, be all the entries naming <span class="math inline">\(r\)</span> with versions above <span class="math inline">\(v_0\)</span>. Suppose each lands a single commit <span class="math inline">\(c_i\)</span> with one parent, read set <span class="math inline">\(\mathsf{R}_i\)</span> and base <span class="math inline">\(b_i\geq v_0\)</span>, either directly or through a platform merge commit whose parents are <span class="math inline">\(S_{v_i-1}(r)\)</span> and <span class="math inline">\(c_i\)</span>, and not as part of a batch. Write <span class="math inline">\(m_i=n_{v_i}\)</span> for the commit the entry installs, so that <span class="math inline">\(m_i=c_i\)</span> on a fast-forward. Under Assumptions <a href="#ass:tlsc:atomic">4.14</a>, <a href="#ass:tlsc:base">6.1</a> and <a href="#ass:tlsc:refine">6.2</a>, for every <span class="math inline">\(i\)</span>:</p>
+<ol>
+<li><p>the values <span class="math inline">\(c_i\)</span> read are the values current at its serialization point: <span class="math inline">\(\tau(S_{b_i}(r))\equiv_{\mathsf{R}_i}\tau(S_{v_i-1}(r))\)</span>;</p></li>
+<li><p>if validation returned FastForward, <span class="math inline">\(S_{v_i}(r)=c_i\)</span> and <span class="math inline">\(S_{v_i-1}(r)=\pi_1(c_i)\)</span>;</p></li>
+<li><p>if validation returned Rebase and the platform merge is the three-way merge of <span class="math inline">\(\pi_1(c_i)\)</span>, <span class="math inline">\(S_{v_i-1}(r)\)</span> and <span class="math inline">\(c_i\)</span>, then <span class="math inline">\(S_{v_i}(r)=m_i\)</span>, the entry’s touched paths satisfy <span class="math inline">\(\mathsf{W}_{v_i}=T(m_i)\subseteq\mathsf{W}(c_i)\)</span>, and <span class="math inline">\(\tau(m_i)\)</span> equals <span class="math inline">\(\tau(c_i)\)</span> on <span class="math inline">\(\mathsf{W}(c_i)\)</span> and equals <span class="math inline">\(\tau(S_{v_i-1}(r))\)</span> elsewhere.</p></li>
+</ol>
+<p>Part 1 holds for every landing, including those validated as Merge. If every landing in the sequence was validated as FastForward or Rebase, the history of <span class="math inline">\(r\)</span> is equivalent to the serial execution of <span class="math inline">\(c_1,\dots,c_m\)</span> in log order, in which each change reads its declared set from the state just before its own entry. Landings validated as Merge are covered by Proposition <a href="#prop:tlsc:merge">6.5</a>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> The landing that appended <span class="math inline">\(e_{v_i}\)</span> either took the fast-forward path or ran validation, and in both cases it did so in the same command as the append, against the log of current version <span class="math inline">\(v_i-1\)</span>.</p>
+<p>Consider the fast-forward path first. The direct land and the combiner take it whenever <span class="math inline">\(\pi_1(c_i)\)</span> equals the head, without running validation. By Assumption <a href="#ass:tlsc:base">6.1</a>, <span class="math inline">\(S_{b_i}(r)=\pi_1(c_i)=S_{v_i-1}(r)\)</span>, and by Theorem <a href="#thm:tlsc:forward">5.4</a> equal values at <span class="math inline">\(b_i\)</span> and <span class="math inline">\(v_i-1\)</span> imply that no entry on <span class="math inline">\(r\)</span> lies between them. So <span class="math inline">\(\mathrm{Later}(P_i)\)</span> is empty, validation would have returned FastForward, part 1 holds trivially, and the append sets <span class="math inline">\(r\)</span> to <span class="math inline">\(c_i\)</span>, which is part 2.</p>
+<p>Otherwise validation ran and did not return Conflict, so no later entry was opaque and <span class="math inline">\(\mathsf{R}_i\not\bowtie\mathsf{W}^{\rho}_u\)</span> for every <span class="math inline">\(e_u\in\mathrm{Later}(P_i)\)</span>. Lemma <a href="#lem:tlsc:frame">6.3</a> with <span class="math inline">\(X=\mathsf{R}_i\)</span> gives part 1.</p>
+<p>For part 3, write <span class="math inline">\(B=\tau(\pi_1(c_i))\)</span>, <span class="math inline">\(H=\tau(S_{v_i-1}(r))\)</span> and <span class="math inline">\(C=\tau(c_i)\)</span>. Rebase means <span class="math inline">\(\mathsf{W}(c_i)\not\bowtie\mathsf{W}_u\)</span> for all later entries on <span class="math inline">\(r\)</span>. Lemma <a href="#lem:tlsc:frame">6.3</a>, applied with the unrefined write sets, for which Assumption <a href="#ass:tlsc:refine">6.2</a> holds by Lemma <a href="#lem:tlsc:append">5.3</a>, shows that <span class="math inline">\(B\)</span> and <span class="math inline">\(H\)</span> agree on <span class="math inline">\(\mathsf{W}(c_i)\)</span>. Outside <span class="math inline">\(\mathsf{W}(c_i)\)</span>, <span class="math inline">\(B\)</span> and <span class="math inline">\(C\)</span> agree because <span class="math inline">\(\Delta(c_i)\subseteq\mathsf{W}(c_i)\)</span>. A three-way merge takes, at each path, the side that differs from the base. On <span class="math inline">\(\mathsf{W}(c_i)\)</span> only <span class="math inline">\(C\)</span> can differ from <span class="math inline">\(B\)</span>, so the result is <span class="math inline">\(C\)</span>; elsewhere only <span class="math inline">\(H\)</span> can differ, so the result is <span class="math inline">\(H\)</span>. The authority prepared <span class="math inline">\(m_i\)</span> with first parent <span class="math inline">\(S_{v_i-1}(r)\)</span> and verified that it touches only paths changed by commits reachable from <span class="math inline">\(c_i\)</span> but not from the head, that is, <span class="math inline">\(T(m_i)\)</span> is contained in those paths (Appendix <a href="#app:tlsc:evidence">A</a>, row 18); since <span class="math inline">\(c_i\)</span> has the single parent <span class="math inline">\(S_{b_i}(r)\)</span>, an ancestor of the head by Theorem <a href="#thm:tlsc:forward">5.4</a>, those paths are <span class="math inline">\(\mathsf{W}(c_i)\)</span>.</p>
+<p>For the equivalence statement we reduce to the serializability theorem of Bernstein, Hadzilacos and Goodman: a history is serializable if and only if its serialization graph is acyclic [<a href="#bib-bhg1987">6</a>, Theorem 2.1]. Treat the state at <span class="math inline">\(v_0\)</span> as initial and model each landing <span class="math inline">\(c_i\)</span> as a transaction that reads every location of <span class="math inline">\(\mathsf{R}_i\)</span> from the snapshot at <span class="math inline">\(b_i\)</span> and writes the locations of its entry’s refined write set <span class="math inline">\(\mathsf{W}^{\rho}_{v_i}\)</span> at <span class="math inline">\(v_i\)</span>, which by Assumption <a href="#ass:tlsc:refine">6.2</a> cover every location it changed, and let two operations conflict when they touch overlapping locations and one is a write. The graph has an edge <span class="math inline">\(c_i\to c_j\)</span> when an operation of <span class="math inline">\(c_i\)</span> precedes a conflicting operation of <span class="math inline">\(c_j\)</span>. Writes happen at append time, in log order, so every write-write edge points forward. A read by <span class="math inline">\(c_j\)</span> of a location written by <span class="math inline">\(c_i\)</span> sees that write only if <span class="math inline">\(v_i\leq b_j&lt;v_j\)</span>, so every write-read edge points forward. A read-write edge <span class="math inline">\(c_j\to c_i\)</span> with <span class="math inline">\(v_i&lt;v_j\)</span> would mean that <span class="math inline">\(c_j\)</span> read a location at <span class="math inline">\(b_j&lt;v_i\)</span> that <span class="math inline">\(c_i\)</span> later wrote, so that <span class="math inline">\(e_{v_i}\in\mathrm{Later}(P_j)\)</span> and <span class="math inline">\(\mathsf{R}_j\bowtie\mathsf{W}^{\rho}_{v_i}\)</span>. Validation refuses exactly that landing, and on the fast-forward path <span class="math inline">\(\mathrm{Later}(P_j)\)</span> is empty. Every edge therefore points forward in log order, the graph is acyclic, and its topological order is the log order. In a history with no Merge outcome, each write of <span class="math inline">\(c_i\)</span> installs the value <span class="math inline">\(c_i\)</span> computed (parts 2 and 3), so the read-write model is exact and the history is conflict-serializable in log order. ◻</p>
+</div>
+<p>Theorem <a href="#thm:tlsc:serializability">6.4</a> guarantees conflict-serializability on one ref for histories of FastForward and Rebase landings, relative to declared read sets. Classical serializability theory [<a href="#bib-bhg1987">6</a>] and Delta’s conflict checker [<a href="#bib-deltaconflictsrc">12</a>] track the data a transaction actually reads; the authority validates only the reads the writer declares, and it ignores entries on other refs, which write other data. When writes overlap, landing falls back from Rebase to a line-level Merge, which Proposition <a href="#prop:tlsc:merge">6.5</a> describes and which the theorem does not cover.</p>
+<p>The theorem also assumes that the platform’s merge is the three-way merge. The authority does not recompute it. It checks that the merge commit names the expected parents, was built by the <code>platform:merge</code> principal, and changes only paths in the merged work’s write set. That the merged tree is the three-way merge rests on the stateless merge code, which the differential test of Section <a href="#sec:tlsc:evidence">10</a> checks against Git.</p>
+<h3 data-number="6.2" id="correspondence-with-kung-and-robinson"><span class="header-section-number">6.2</span> Correspondence with Kung and Robinson</h3>
+<p>Kung and Robinson assign each transaction a number at the end of its read phase and accept transaction <span class="math inline">\(T_j\)</span> if, for every <span class="math inline">\(T_i\)</span> with a smaller number, one of three conditions holds: <span class="math inline">\(T_i\)</span> finished writing before <span class="math inline">\(T_j\)</span> started reading; or the write set of <span class="math inline">\(T_i\)</span> does not intersect the read set of <span class="math inline">\(T_j\)</span> and <span class="math inline">\(T_i\)</span> finished writing before <span class="math inline">\(T_j\)</span> started writing; or the write set of <span class="math inline">\(T_i\)</span> meets neither the read set nor the write set of <span class="math inline">\(T_j\)</span> and <span class="math inline">\(T_i\)</span> finished its read phase first [<a href="#bib-kung1981occ">23</a>]. They show that the conditions guarantee a serially equivalent schedule in transaction-number order [<a href="#bib-kung1981occ">23</a>].</p>
+<p>Their serial validation implements the first two conditions: a transaction records the current transaction number when it starts, and at its end checks, inside one critical section, the write set of every transaction numbered after its start against its own read set, writing and taking the next number only if no intersection is found [<a href="#bib-kung1981occ">23</a>, Section 4]. A landing is that end step with start number <span class="math inline">\(b\)</span> and finish number <span class="math inline">\(n\)</span>, and Assumption <a href="#ass:tlsc:atomic">4.14</a> supplies the critical section. The mapping is direct. The log version is the transaction number, assigned at append time, which is the end of the read phase. Entries at or below the base satisfy the first condition: they were in the snapshot the writer read. Entries above the base are validated by the second condition: their writes must not meet the change’s reads, and they finished writing before the change writes, because appends are serial. Entries on other refs write other data and never meet a read of <span class="math inline">\(r\)</span>. The third condition, which allows overlapping write phases, is never needed, because the write phase is one transaction.</p>
+<p>The departure is in write-write overlap. Under the second condition, a later transaction may overwrite a file an earlier one wrote, provided it did not read it. Taken literally for source code, that rule would let a change replace a whole file and silently discard a concurrent edit to other lines. The platform instead treats overlapping writes as a Merge and combines the two edits line by line. In effect it treats each change’s write as a patch, a set of edited regions relative to its base, rather than as a new value of the file.</p>
+<div class="proposition">
+<p><strong>Proposition 6.5</strong> (Merged writes). <span id="prop:tlsc:merge" data-label="prop:tlsc:merge"></span> Suppose validation of <span class="math inline">\(c\)</span> against head <span class="math inline">\(S_{n}(r)\)</span> returns Merge with overlapping paths <span class="math inline">\(M\)</span>, and the platform’s three-way merge succeeds. Then the landed tree equals <span class="math inline">\(\tau(c)\)</span> on <span class="math inline">\(\mathsf{W}(c)\setminus M\)</span>, equals the head on the paths outside <span class="math inline">\(\mathsf{W}(c)\)</span>, and on each <span class="math inline">\(p\in M\)</span> equals the line-level three-way merge of the base, head and change versions of <span class="math inline">\(p\)</span>.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> The argument of part 3 of Theorem <a href="#thm:tlsc:serializability">6.4</a> applies verbatim to each path outside <span class="math inline">\(M\)</span>. On <span class="math inline">\(p\in M\)</span>, the platform’s tree merge calls its line merge with the three versions, and the result is whatever that merge returns. ◻</p>
+</div>
+<p>Proposition <a href="#prop:tlsc:merge">6.5</a> is a description, not a serializability claim. In serializability theory, operations other than reads and writes may be treated as non-conflicting only if their combined effect does not depend on the order in which they run [<a href="#bib-bhg1987">6</a>, Section 2.5]. Two merged edits to one file would qualify only if a clean merge always equaled applying the edits in either order. No such theorem holds for <code>diff3</code>: Khanna, Kunal and Pierce show that the most obvious formulations of the intuition that edits to well-separated regions never conflict are wrong, and that idempotence and stability fail in general [<a href="#bib-khanna2007diff3">22</a>]. The platform’s merge is tested against Git’s own, not proved: on 300 randomly generated three-way merges, it agreed with <code>git merge-file</code> using the histogram diff on every case about whether the merge was clean, and on the result whenever it was. A clean textual merge can still be semantically wrong. The platform therefore runs the policy’s checks on every merged result after it lands and proposes a revert commit when a check fails.</p>
+<h3 data-number="6.3" id="sec:tlsc:isolation"><span class="header-section-number">6.3</span> Isolation levels</h3>
+<p>Reads are snapshot reads: a read at version <span class="math inline">\(u\)</span> sees <span class="math inline">\(S_{u}\)</span> and nothing later, by Theorem <a href="#thm:tlsc:snapshot-immutability">5.6</a>. Landings validated as FastForward or Rebase are serializable relative to declared reads, by Theorem <a href="#thm:tlsc:serializability">6.4</a>, and merged writes satisfy Proposition <a href="#prop:tlsc:merge">6.5</a>. Overlapping writes are reconciled by a three-way merge instead of first-committer-wins.</p>
+<p>The system therefore does not provide snapshot isolation at the granularity of files. Snapshot isolation lets a transaction commit only if no concurrent transaction that committed first wrote data it also wrote, the first-committer-wins rule [<a href="#bib-berenson1995critique">4</a>]; in Adya’s formulation, concurrent transactions may not modify the same objects [<a href="#bib-adya1999thesis">1</a>, Section 4.3]. The Merge outcome lets two concurrent writers of one path both commit. A read that a writer does not declare is a snapshot read and carries no further guarantee. Its typical failure is write skew, phenomenon A5B of Berenson and colleagues, in which two transactions read overlapping data and write disjoint parts of it [<a href="#bib-berenson1995critique">4</a>].</p>
+<div class="example">
+<p><strong>Example 6.6</strong> (Write skew from undeclared reads). <span id="ex:tlsc:skew" data-label="ex:tlsc:skew"></span> Files <code>a.rs</code> and <code>b.rs</code> each define half of a protocol that must agree. Change <span class="math inline">\(c_1\)</span> reads both files and edits <code>a.rs</code>; change <span class="math inline">\(c_2\)</span> reads both and edits <code>b.rs</code>; both are based on the same version and neither declares a read set. Whichever lands second sees a later entry that wrote a file it did not write, so validation returns Rebase and both land. The result contains both edits, and neither change ever saw the other. This is the A5B pattern. If both declare <span class="math inline">\(\mathsf{R}=\{\text{\texttt{\small a.rs}},\text{\texttt{\small b.rs}}\}\)</span>, the second to land has <span class="math inline">\(\mathsf{R}\bowtie\mathsf{W}\)</span> of the first and gets a Conflict.</p>
+</div>
+<p>The example shows why declared reads carry the guarantee. The implementation keeps reads conservative in two ways. A read that cannot be resolved to symbols stays a whole-file read, and the plan builder of Part II (Section 10) adds the symbols that a read symbol references, to a chosen depth, before checking independence.</p>
+<h3 data-number="6.4" id="sec:tlsc:eq1"><span class="header-section-number">6.4</span> Independence as a scheduling rule</h3>
+<p>Condition <a href="#eq:tlsc:independent">(1)</a> is two-sided and is evaluated before work runs; validation is one-sided and is evaluated at landing, against what actually landed. The following theorem states the exact relation at path granularity.</p>
+<div class="theorem">
+<p><strong>Theorem 6.7</strong> (Independence is order-insensitive landing without merge). <span id="thm:tlsc:eq1" data-label="thm:tlsc:eq1"></span> Let <span class="math inline">\(c_i\)</span> and <span class="math inline">\(c_j\)</span> be commits on the same base <span class="math inline">\(b\)</span> of ref <span class="math inline">\(r\)</span>, with read and write sets at path granularity, and suppose no other entry on <span class="math inline">\(r\)</span> is appended between <span class="math inline">\(b\)</span> and their landings. The following are equivalent.</p>
+<ol>
+<li><p><span class="math inline">\(c_i\)</span> and <span class="math inline">\(c_j\)</span> satisfy <a href="#eq:tlsc:independent">(1)</a>.</p></li>
+<li><p>In both landing orders, the second change to land is validated as Rebase.</p></li>
+</ol>
+</div>
+<div class="proof">
+<p><em>Proof.</em> If <span class="math inline">\(c_i\)</span> lands first, <span class="math inline">\(\mathrm{Later}\)</span> of <span class="math inline">\(c_j\)</span> is exactly the entry that landed <span class="math inline">\(c_i\)</span>, which writes <span class="math inline">\(\mathsf{W}_i\)</span> and is not opaque. Validation of <span class="math inline">\(c_j\)</span> returns Conflict if <span class="math inline">\(\mathsf{R}_j\bowtie\mathsf{W}_i\)</span>, otherwise Merge if <span class="math inline">\(\mathsf{W}_j\bowtie\mathsf{W}_i\)</span>, otherwise Rebase. So <span class="math inline">\(c_j\)</span> is a Rebase exactly when <span class="math inline">\(\mathsf{W}_i\not\bowtie\mathsf{R}_j\)</span> and <span class="math inline">\(\mathsf{W}_i\not\bowtie\mathsf{W}_j\)</span>. Symmetrically, with <span class="math inline">\(c_j\)</span> first, <span class="math inline">\(c_i\)</span> is a Rebase exactly when <span class="math inline">\(\mathsf{W}_j\not\bowtie\mathsf{R}_i\)</span> and <span class="math inline">\(\mathsf{W}_j\not\bowtie\mathsf{W}_i\)</span>. The conjunction of the two is <a href="#eq:tlsc:independent">(1)</a>, because <span class="math inline">\(\bowtie\)</span> is symmetric. ◻</p>
+</div>
+<div class="corollary">
+<p><strong>Corollary 6.8</strong> (Symbol granularity). <span id="cor:tlsc:symbols" data-label="cor:tlsc:symbols"></span> If <span class="math inline">\(c_i\)</span> and <span class="math inline">\(c_j\)</span> satisfy <a href="#eq:tlsc:independent">(1)</a> with refined write sets and symbol-level read sets, then in either order the second change is not a Conflict. It is a Rebase if their path-level write sets are disjoint and a Merge otherwise.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> The stale-read test uses refined writes, so the argument of Theorem <a href="#thm:tlsc:eq1">6.7</a> gives no Conflict in either order. The Rebase and Merge tests use path-level writes, which may overlap when two changes edit different symbols of one file. ◻</p>
+</div>
+<p>In the terms of serializability theory, condition <a href="#eq:tlsc:independent">(1)</a> says that the two changes have no conflicting operations, and for such a pair both serial orders are equivalent [<a href="#bib-bhg1987">6</a>, Sections 2.1 and 2.2]; it is the condition Bernstein gave for running two program segments in parallel (see [<a href="#bib-bernstein1966">5</a>]). Theorem <a href="#thm:tlsc:eq1">6.7</a> shows that the validator honours this exactly: its outcome is independent of landing order precisely when the pair has no conflict. The theorem carries over to the code because the scheduler’s independence test and the landing validation use the same path comparison.</p>
+<div class="example">
+<p><strong>Example 6.9</strong> (Validation accepts what independence rejects). <span id="ex:tlsc:onesided" data-label="ex:tlsc:onesided"></span> Let <span class="math inline">\(c_i\)</span> read <code>config.toml</code> and write <code>src/a.rs</code>, and let <span class="math inline">\(c_j\)</span> write <code>config.toml</code>. Condition <a href="#eq:tlsc:independent">(1)</a> fails because <span class="math inline">\(\mathsf{W}_j\bowtie\mathsf{R}_i\)</span>. If <span class="math inline">\(c_i\)</span> lands first, <span class="math inline">\(c_j\)</span> is validated against an entry that wrote <code>src/a.rs</code>, which it neither read nor wrote, and it lands as a Rebase. The result is serializable in the order <span class="math inline">\(c_i,c_j\)</span>. If <span class="math inline">\(c_j\)</span> lands first, <span class="math inline">\(c_i\)</span> has a stale read and is refused.</p>
+</div>
+<p>Validation is a safety rule: it refuses every landing whose declared reads are stale at its position in the log. Independence is a scheduling rule: a scheduler that starts two items at once does not know which will land first, and Theorem <a href="#thm:tlsc:eq1">6.7</a> says that <a href="#eq:tlsc:independent">(1)</a> is exactly the condition under which the outcome does not depend on that race. A scheduler that ignores <a href="#eq:tlsc:independent">(1)</a> remains safe, because validation still holds, but it wastes work on whichever item loses. This division is also the one the companion paper draws when it says that integration should reject stale assumptions even for items believed independent [<a href="#bib-long2026inversion">24</a>].</p>
+<div class="proposition">
+<p><strong>Proposition 6.10</strong> (Coarsening is sound). <span id="prop:tlsc:coarsening" data-label="prop:tlsc:coarsening"></span> Replace any access <span class="math inline">\(a\)</span> in a read or write set by an access <span class="math inline">\(a&#39;\)</span> with <span class="math inline">\(a&#39;\sqsubseteq a\)</span>, for instance a symbol by its file or a file by its directory. Then every Conflict and every Merge outcome of the original sets is still a Conflict or a Merge, every pair that satisfies <a href="#eq:tlsc:independent">(1)</a> after coarsening satisfied it before, and Assumption <a href="#ass:tlsc:refine">6.2</a> is preserved.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> By Lemma <a href="#lem:tlsc:overlap">4.5</a>, <span class="math inline">\(a\bowtie x\)</span> implies <span class="math inline">\(a&#39;\bowtie x\)</span>, so every overlap between the original sets persists, and the coarse sets meet whenever the fine ones do. Each outcome and condition <a href="#eq:tlsc:independent">(1)</a> are monotone in overlap in the stated direction. For Assumption <a href="#ass:tlsc:refine">6.2</a>, <span class="math inline">\(\mathrm{sub}(a)\subseteq\mathrm{sub}(a&#39;)\)</span>, so any location covered by the fine write set is covered by the coarse one. ◻</p>
+</div>
+<p>Proposition <a href="#prop:tlsc:coarsening">6.10</a> is the validation counterpart of multigranularity locking, in which a lock on a granule implicitly covers all of its descendants and coarser granules trade concurrency for lower overhead [<a href="#bib-bhg1987">6</a>, Section 3.9]. It justifies the rule that anything not resolved to symbols stays a whole path: coarsening can only cost concurrency, never correctness. The tests <code>symbol_reads_conflict_only_with_writes_to_that_symbol</code> and <code>unresolved_writes_stay_whole_files</code> exercise the two directions in the implementation.</p>
+<h2 data-number="7" id="sec:tlsc:combiner"><span class="header-section-number">7</span> The land combiner</h2>
+<h3 data-number="7.1" id="mechanism"><span class="header-section-number">7.1</span> Mechanism</h3>
+<p>Validation makes a lost race cheap, but it does not make it free. When a hundred writers land on one branch at once, each landing after the first finds that the branch moved and needs a merge commit, and each merge commit is stale as soon as another landing succeeds. Without coordination the writers would rebuild merges against a moving head. The land combiner replaces that race by one merge per batch.</p>
+<div class="definition">
+<p><strong>Definition 7.1</strong> (Land combiner). <span id="def:tlsc:combiner" data-label="def:tlsc:combiner"></span> For each branch <span class="math inline">\(r\)</span> the authority keeps a queue of <em>tickets</em>, each naming a commit and a status of pending, landed or failed, and at most one <em>lease</em> <span class="math inline">\((r,\epsilon,t_{\mathrm{exp}})\)</span> with an epoch <span class="math inline">\(\epsilon\)</span> and an expiry time. The combiner has four commands.</p>
+<dl>
+<dt>Enqueue</dt>
+<dd>
+<p>adds a pending ticket for a commit whose gates are satisfied, or returns the existing pending ticket for the same commit and branch.</p>
+</dd>
+<dt>Claim</dt>
+<dd>
+<p>returns a wait hint if an unexpired lease exists. Otherwise it takes up to 64 pending tickets in ticket order, sets the lease to epoch <span class="math inline">\(\epsilon+1\)</span> with expiry 30 seconds ahead, fails at once every ticket whose validation is a Conflict or whose commit is stale, and returns the rest together with the head and the trees each merge needs.</p>
+</dd>
+<dt>Land batch</dt>
+<dd>
+<p>takes an epoch, a list of tickets to land, a list of failures and optionally a merge commit. It refuses unless the lease’s epoch equals the given epoch. It records the failures. Without a merge it lands a single ticket whose commit has the head as first parent. With a merge it verifies that the merge’s parents are exactly the head followed by the landed commits, that the merge was built by the platform’s merge principal, that every landed commit still validates against the log, and that the merge changes only paths that some landed commit changed. It then appends one merge entry whose touched paths are those of the merge commit relative to the head, whose read set is the union of the members’ read sets and whose base is the smallest member base, writes one landings row per member, marks the tickets landed and deletes the lease.</p>
+</dd>
+<dt>Release</dt>
+<dd>
+<p>deletes the lease of a given epoch.</p>
+</dd>
+</dl>
+</div>
+<p>Only the platform’s merge principal may claim. The adapter’s land route first tries a direct landing. If the branch has queued work or the commit needs a merge, the direct landing is refused, the commit is enqueued, and the route alternates between polling its ticket and trying to claim the queue itself; whichever request holds the lease builds the merge for the whole batch. While building, the adapter merges each claimed item against the head in ticket order, fails items whose three-way merge conflicts, defers to the next batch any item whose merged paths overlap those of an earlier accepted item, and builds one octopus merge commit of the head and every accepted item. A batch that contains a fast-forward item lands that item alone.</p>
+<p>The combiner is group commit applied to refs. DeWitt and colleagues describe committing all transactions whose commit records share a log page with a single log write, and call the idea database folklore [<a href="#bib-dewitt1984main">16</a>]. Here the shared resource is the head of a branch rather than a log device, and the unit amortized is the construction of a merge against that head. Mononoke’s pushrebase solves the same problem differently: the server rebases pushed commits onto the moving bookmark when no file conflicts, treating two commits that modify the same file as conflicting even when they change different lines, and gives the rebased commits new hashes [<a href="#bib-mononokepushrebase">28</a>]. The combiner keeps the landed commits’ identifiers, records the batch as a merge, and merges same-file edits at line level.</p>
+<h3 data-number="7.2" id="safety"><span class="header-section-number">7.2</span> Safety</h3>
+<div class="theorem">
+<p><strong>Theorem 7.2</strong> (Combiner safety). <span id="thm:tlsc:combiner-safety" data-label="thm:tlsc:combiner-safety"></span> Under Assumption <a href="#ass:tlsc:atomic">4.14</a>:</p>
+<ol>
+<li><p>at most one entry is appended per version, and every entry appended by the combiner satisfies Lemma <a href="#lem:tlsc:append">5.3</a>;</p></li>
+<li><p>a land-batch command whose epoch is not the lease’s current epoch changes no state;</p></li>
+<li><p>each ticket is landed at most once, and each landed commit has exactly one landings row on its branch;</p></li>
+<li><p>each member <span class="math inline">\(c\)</span> of a landed batch at version <span class="math inline">\(v\)</span> satisfies <span class="math inline">\(\tau(S_{b_c}(r))\equiv_{\mathsf{R}_c}\tau(S_{v-1}(r))\)</span>, where <span class="math inline">\(b_c\)</span> is its base, provided Assumptions <a href="#ass:tlsc:base">6.1</a> and <a href="#ass:tlsc:refine">6.2</a> hold;</p></li>
+<li><p>properties 1 to 4 hold whatever the lease state, including after a lease expires while its holder is still building a merge.</p></li>
+</ol>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Properties 1 to 3 say that the authority meets Delta’s ratification contract for the batch path: each version is ratified once, after its predecessor [<a href="#bib-deltaprotocol">15</a>]. Property 1: the log’s version column is a primary key and commands are serial, so two appends cannot share a version. The combiner’s two append sites are covered in the proof of Lemma <a href="#lem:tlsc:append">5.3</a>. Property 2: the epoch check is the first state-dependent step, and its failure returns an error, which rolls the command back. Property 3: landing requires each ticket to be pending, marks it landed in the same transaction, and the landings table has a primary key on commit and ref. Property 4 is the serial validation of Kung and Robinson applied to each member [<a href="#bib-kung1981occ">23</a>, Section 4]: verification re-runs validation for each member against the log of current version <span class="math inline">\(v-1\)</span> inside the appending command and accepts only Rebase, Merge, or a fast-forward on the current head. In the first two cases no entry in <span class="math inline">\(\mathrm{Later}\)</span> of <span class="math inline">\(c\)</span> is opaque or meets <span class="math inline">\(\mathsf{R}_c\)</span>. In the third, <span class="math inline">\(\pi_1(c)=S_{v-1}(r)\)</span> and <span class="math inline">\(\pi_1(c)=S_{b_c}(r)\)</span> by Assumption <a href="#ass:tlsc:base">6.1</a>, so <span class="math inline">\(\mathrm{Later}\)</span> of <span class="math inline">\(c\)</span> is empty by Theorem <a href="#thm:tlsc:forward">5.4</a>. Lemma <a href="#lem:tlsc:frame">6.3</a> gives the agreement in all three cases. Property 5: none of the arguments for 1 to 4 uses the lease. The head is re-read and the parents re-checked in the appending transaction, so a merge built on a head that has since moved fails with a stale-parent error and rolls back, whoever holds the lease. ◻</p>
+</div>
+<p>The lease is therefore a performance device. It stops several requests from building merges against the same head at once, and it orders merge construction, but correctness rests on the checks inside the appending command. This is the right division for a platform where any adapter request can die mid-flight: a lease held by a dead request expires after 30 seconds, and its holder, if it wakes up, can do no harm.</p>
+<h3 data-number="7.3" id="write-skew-inside-a-batch"><span class="header-section-number">7.3</span> Write skew inside a batch</h3>
+<p>Property 4 of Theorem <a href="#thm:tlsc:combiner-safety">7.2</a> validates each member against the log. It does not validate members against each other, and the adapter’s deferral rule compares only merged write paths. That leaves an anomaly.</p>
+<div class="theorem">
+<p><strong>Theorem 7.3</strong> (Batch write skew). <span id="thm:tlsc:batchskew" data-label="thm:tlsc:batchskew"></span> At commit <code>cfa4845</code>, there are histories in which the combiner lands two commits <span class="math inline">\(c_a\)</span> and <span class="math inline">\(c_b\)</span> in one entry such that <span class="math inline">\(\mathsf{R}_a\bowtie\mathsf{W}_b\)</span> and <span class="math inline">\(\mathsf{R}_b\bowtie\mathsf{W}_a\)</span>. For such a pair no serial order of <span class="math inline">\(c_a\)</span> and <span class="math inline">\(c_b\)</span> lets each read its declared set from the state the other leaves.</p>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Let the head be <span class="math inline">\(h\)</span> at version <span class="math inline">\(b\)</span>. Let <span class="math inline">\(c_a\)</span> and <span class="math inline">\(c_b\)</span> have first parent <span class="math inline">\(h\)</span> and base <span class="math inline">\(b\)</span>, with <span class="math inline">\(\mathsf{R}_a=\{\text{\texttt{\small x}}\}\)</span>, <span class="math inline">\(\mathsf{W}_a=\{\text{\texttt{\small y}}\}\)</span>, <span class="math inline">\(\mathsf{R}_b=\{\text{\texttt{\small y}}\}\)</span> and <span class="math inline">\(\mathsf{W}_b=\{\text{\texttt{\small x}}\}\)</span>. Let a third commit <span class="math inline">\(c_0\)</span> that writes only <code>z</code> land as a fast-forward at version <span class="math inline">\(b+1\)</span>, so neither <span class="math inline">\(c_a\)</span> nor <span class="math inline">\(c_b\)</span> is a fast-forward any more. Both direct landings are refused with a merge-required error and both are enqueued. At the next claim, validation of each against <span class="math inline">\(\mathrm{Later}=(e_{b+1})\)</span> finds that <code>z</code> meets neither read set and neither write set, so both are Rebase items. The adapter merges each against the head; the merged paths are <code>y</code> and <code>x</code>, which do not overlap, so both are accepted into one octopus merge. Land batch re-validates each against the same log and finds no conflict, checks the parents and paths, and appends the merge. In the serial order <span class="math inline">\(c_a,c_b\)</span>, the change <span class="math inline">\(c_b\)</span> would read <code>y</code> after <span class="math inline">\(c_a\)</span> wrote it, which differs from what it read; in the order <span class="math inline">\(c_b,c_a\)</span>, the change <span class="math inline">\(c_a\)</span> would read <code>x</code> after <span class="math inline">\(c_b\)</span> wrote it. ◻</p>
+</div>
+<p>The anomaly is a known one. The two members form a cycle <span class="math inline">\(c_a\to c_b\to c_a\)</span> of read-write anti-dependency edges in Adya’s direct serialization graph, which is phenomenon G2-item [<a href="#bib-adya1999thesis">1</a>, Section 3.2.4], and the history has the shape of Berenson’s write skew A5B [<a href="#bib-berenson1995critique">4</a>]. Fekete and colleagues prove that every non-serializable history under snapshot isolation contains two consecutive anti-dependency edges between concurrent transactions, possibly returning to the same transaction [<a href="#bib-fekete2005serializable">17</a>, Theorem 2.1]; the batch pair is the smallest instance. Validating each member against the committed log but not against the other members is certification in the style of snapshot isolation, and this is its expected failure. We do not call the combiner snapshot-isolated, because the check that keeps members’ writes disjoint runs in the adapter and the authority does not repeat it.</p>
+<p>The finding has since changed the code. Revision <code>c4c8f47</code> added the check of Proposition <a href="#prop:tlsc:batchfix">7.4</a> to the combiner and to the authority’s batch verification, refusing a member that reads or writes what an earlier member wrote with a <code>WRITE_SKEW</code> error. The batch landing path merged into the development branch at <code>fef94e7</code> calls the same check for every member before routing it, and defers a member that fails it to the next batch (Section <a href="#sec:tlsc:n11proof">8</a>). The check has not been exercised: the hosted benchmarks write disjoint files, so they could not show write skew with or without it. At <code>cfa4845</code> and <code>03821e0</code>, the combiner has no such check.</p>
+<p>The same pair landed one at a time would not both succeed: whichever landed second would see the other’s entry in <span class="math inline">\(\mathrm{Later}\)</span> and fail with a stale read. The anomaly is specific to batching, and it arises exactly when the branch has moved, which is when the combiner is in use. It is a gap between the implementation and Theorem <a href="#thm:tlsc:serializability">6.4</a>, not a property of the log design, and the following rule closes it.</p>
+<div class="proposition">
+<p><strong>Proposition 7.4</strong> (Serializable batches). <span id="prop:tlsc:batchfix" data-label="prop:tlsc:batchfix"></span> Suppose the authority’s batch verification also requires, for the accepted members <span class="math inline">\(c_1,\dots,c_k\)</span> in ticket order, that <span class="math inline">\((\mathsf{R}_j\cup\mathsf{W}(c_j))\not\bowtie\mathsf{W}(c_i)\)</span> for all <span class="math inline">\(i&lt;j\)</span>, using the recorded write sets, and that the merge of each member is the three-way merge against the head. Then:</p>
+<ol>
+<li><p>the batch entry produces the same branch state as landing <span class="math inline">\(c_1,\dots,c_k\)</span> one at a time in ticket order, and each of those sequential landings would have been validated without a Conflict;</p></li>
+<li><p>if, in addition, every member’s validation against the log returned Rebase or FastForward, the history consisting of the preceding entries and the batch, with members ordered by ticket, is conflict-serializable.</p></li>
+</ol>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Let <span class="math inline">\(H_0\)</span> be the head tree and let <span class="math inline">\(H_j\)</span> be <span class="math inline">\(H_{j-1}\)</span> with the merged changes of <span class="math inline">\(c_j\)</span> applied. The merged changes of <span class="math inline">\(c_j\)</span> are confined to <span class="math inline">\(\mathsf{W}(c_j)\)</span>, because a three-way merge differs from the head only where the member differs from its base, and <span class="math inline">\(\Delta(c_j)\subseteq\mathsf{W}(c_j)\)</span>. The recorded write sets are pairwise disjoint by the new rule, so the merged changes of distinct members touch disjoint paths and <span class="math inline">\(H_k\)</span> is the tree of the octopus merge. Consider member <span class="math inline">\(j\)</span>. Its reads agree between its base and <span class="math inline">\(H_0\)</span> by Theorem <a href="#thm:tlsc:combiner-safety">7.2</a>. Between <span class="math inline">\(H_0\)</span> and <span class="math inline">\(H_{j-1}\)</span> only paths in <span class="math inline">\(\bigcup_{i&lt;j}\mathsf{W}(c_i)\)</span> change, and the rule keeps these disjoint from <span class="math inline">\(\mathsf{R}_j\)</span>, so its reads agree with <span class="math inline">\(H_{j-1}\)</span> as well. Sequential validation of <span class="math inline">\(c_j\)</span> after <span class="math inline">\(c_1,\dots,c_{j-1}\)</span> would find no stale read for the same reason, and no new write overlap because <span class="math inline">\(\mathsf{W}(c_j)\not\bowtie\mathsf{W}(c_i)\)</span>. Finally, <span class="math inline">\(H_0\)</span> and <span class="math inline">\(H_{j-1}\)</span> agree on <span class="math inline">\(\mathsf{W}(c_j)\)</span>, so the merge of <span class="math inline">\(c_j\)</span> against <span class="math inline">\(H_{j-1}\)</span> equals its merge against <span class="math inline">\(H_0\)</span> on <span class="math inline">\(\mathsf{W}(c_j)\)</span> and keeps <span class="math inline">\(H_{j-1}\)</span> elsewhere. This is the state that sequential landing in ticket order produces, which proves part 1.</p>
+<p>For part 2, build the serialization graph as in the proof of Theorem <a href="#thm:tlsc:serializability">6.4</a>, with the members placed in ticket order after the entries that precede the batch. Edges between earlier entries and members point forward by that proof, because each member was validated against the log. Between members, writes are pairwise disjoint, so there are no write-write edges, and the rule forbids a read by <span class="math inline">\(c_j\)</span> of a location written by an earlier member <span class="math inline">\(c_i\)</span>, so every read-write edge between members points forward in ticket order. The graph is acyclic, and Theorem 2.1 of Bernstein, Hadzilacos and Goodman gives conflict-serializability [<a href="#bib-bhg1987">6</a>]. Without the extra hypothesis of part 2, a member validated as Merge carries the weaker guarantee of Proposition <a href="#prop:tlsc:merge">6.5</a>. ◻</p>
+</div>
+<p>The rule is sufficient, not necessary, in two ways. It compares reads with the unrefined write sets <span class="math inline">\(\mathsf{W}(c_i)\)</span>, whereas sequential validation compares them with the refined sets <span class="math inline">\(\mathsf{W}^{\rho}\)</span>, so with symbol-level reads the rule refuses some members that sequential landing would accept; using <span class="math inline">\(\mathsf{W}^{\rho}(c_i)\)</span> in the rule would remove that difference. More generally, a certifier that builds the batch’s serialization graph and accepts whenever the graph is acyclic, in the manner of serialization-graph-testing certifiers [<a href="#bib-bhg1987">6</a>, Section 4.4], accepts strictly more batches: those that are serializable in an order other than ticket order. Because members’ writes are pairwise disjoint, every topological order yields the same tree, so the batch entry would not depend on which order the certifier found. Serializable snapshot isolation is a further alternative (see [<a href="#bib-cahill2008ssi">7</a>]).</p>
+<p>The rule costs one overlap test per pair of accepted members, at most <span class="math inline">\(64\cdot 63/2\)</span> tests per batch. It belongs in the authority’s verification, because the authority is the component that must not trust its callers: today the only write-disjointness check inside a batch is the adapter’s comparison of merged paths, which the authority does not repeat. Members that fail the rule need not fail; deferring them to the next batch preserves the stale-read semantics of sequential landing.</p>
+<h3 data-number="7.4" id="liveness-and-post-land-checks"><span class="header-section-number">7.4</span> Liveness and post-land checks</h3>
+<p>The combiner trades a liveness assumption for its efficiency. While a branch has pending tickets, direct landings on it are refused and join the queue, so the branch advances only if some request claims. In the implementation every waiting land request tries to claim, so progress needs only one live request per branch; a request that gives up after its deadline leaves its ticket pending for others to land. A lease abandoned by a crashed request blocks claims for at most 30 seconds. We have not proved a bound on how long a ticket can wait, and the hosted measurements of Section <a href="#sec:tlsc:evidence">10</a> show that waiting for claims dominates landing latency under load.</p>
+<div class="definition">
+<p><strong>Definition 7.5</strong> (Repair commit). <span id="def:tlsc:repair" data-label="def:tlsc:repair"></span> When a required check fails on a commit that has already landed, the platform records, for each branch the commit landed on, a <em>repair</em>: a proposed commit on that branch that reverts the failing change, or the reason no such commit could be built. The repair is a new commit that lands through the ordinary path.</p>
+</div>
+<p>Post-land checks exist because validation sees only declared sets, and merged changes have never been tested together. The companion paper’s warning that independent textual patches still require combined acceptance [<a href="#bib-long2026inversion">24</a>] is implemented as a check stage after every merge or landing and a repair proposal on failure. Repairs and break-glass actions add commits; neither rewrites a ref, which is Corollary <a href="#cor:tlsc:nolostupdate">5.5</a> applied to the implementation.</p>
+<h2 data-number="8" id="sec:tlsc:n11proof"><span class="header-section-number">8</span> Changeset landing</h2>
+<p>This section states the changeset landing path of Section <a href="#sec:tlsc:n11">3.6</a> in the model and checks each earlier result against it. The statements are about the design; the paragraph after the proof records what the implementation at <code>dd6c9a8</code> does.</p>
+<div class="definition">
+<p><strong>Definition 8.1</strong> (Changeset landing). <span id="def:tlsc:changeset" data-label="def:tlsc:changeset"></span> A <em>changeset</em> on ref <span class="math inline">\(r\)</span> is <span class="math inline">\(\chi=(r,b,\mathsf{R},\mathsf{W},\Phi)\)</span>: a base version <span class="math inline">\(b\)</span>, a declared read set <span class="math inline">\(\mathsf{R}\)</span>, a set <span class="math inline">\(\mathsf{W}\)</span> of file paths, and a map <span class="math inline">\(\Phi\)</span> giving for each path in <span class="math inline">\(\mathsf{W}\)</span> its new content or its deletion. The <em>branch state</em> <span class="math inline">\(\sigma_v(r)\)</span> is the tree state obtained by applying, in log order, the effective changes of the entries naming <span class="math inline">\(r\)</span> with version at most <span class="math inline">\(v\)</span>. A changeset validated as FastForward or Rebase is appended with effective change <span class="math inline">\(\Phi\)</span>. A changeset validated as Merge is appended with the effective change produced by the three-way merge of each shared file. A <em>projection</em> is a function <span class="math inline">\(\Pi\)</span> that maps each log prefix <span class="math inline">\((e_1,\dots,e_v)\)</span> and ref <span class="math inline">\(r\)</span> to a Git commit whose tree is <span class="math inline">\(\sigma_v(r)\)</span>.</p>
+</div>
+<div class="assumption">
+<p><strong>Assumption 8.2</strong> (Deterministic linear projection). <span id="ass:tlsc:projection" data-label="ass:tlsc:projection"></span> <span class="math inline">\(\Pi\)</span> is deterministic, and when <span class="math inline">\(e_v\)</span> names <span class="math inline">\(r\)</span> the commit <span class="math inline">\(\Pi(e_1,\dots,e_v;r)\)</span> has first parent <span class="math inline">\(\Pi(e_1,\dots,e_{v-1};r)\)</span>.</p>
+</div>
+<div class="proposition">
+<p><strong>Proposition 8.3</strong> (Carry-over). <span id="prop:tlsc:carryover" data-label="prop:tlsc:carryover"></span> Under Assumptions <a href="#ass:tlsc:atomic">4.14</a> and <a href="#ass:tlsc:refine">6.2</a>, with validation as in Definition <a href="#def:tlsc:validation">4.15</a> and the changeset’s <span class="math inline">\(\mathsf{W}\)</span> in place of <span class="math inline">\(\mathsf{W}(c)\)</span>:</p>
+<ol>
+<li><p>Theorems <a href="#thm:tlsc:replay">5.1</a> and <a href="#thm:tlsc:snapshot-immutability">5.6</a> and Proposition <a href="#prop:tlsc:tamper">5.2</a> hold unchanged for the log, and <span class="math inline">\(\sigma_u(r)\)</span> is a function of <span class="math inline">\(u\)</span> alone.</p></li>
+<li><p>Assumption <a href="#ass:tlsc:base">6.1</a> holds by construction, because a changeset has no parent that could disagree with its base.</p></li>
+<li><p>Lemma <a href="#lem:tlsc:frame">6.3</a>, part 1 of Theorem <a href="#thm:tlsc:serializability">6.4</a> and its serializability statement hold, with the entry’s own changes in place of the installed commit. Parts 2 and 3 hold by definition: for FastForward and Rebase, <span class="math inline">\(\sigma_v(r)\)</span> equals <span class="math inline">\(\sigma_{v-1}(r)\)</span> with <span class="math inline">\(\Phi\)</span> applied, which is what the three-way merge of Theorem <a href="#thm:tlsc:serializability">6.4</a> produces when write sets are disjoint.</p></li>
+<li><p>Theorem <a href="#thm:tlsc:eq1">6.7</a>, Corollary <a href="#cor:tlsc:symbols">6.8</a>, Propositions <a href="#prop:tlsc:merge">6.5</a> and <a href="#prop:tlsc:coarsening">6.10</a> hold unchanged.</p></li>
+<li><p>Under Assumption <a href="#ass:tlsc:projection">8.2</a>, Theorem <a href="#thm:tlsc:forward">5.4</a> and Corollary <a href="#cor:tlsc:nolostupdate">5.5</a> hold for projected commits: the projected commit at version <span class="math inline">\(u\)</span> is a first-parent ancestor of the projected commit at any later version, and has the same identifier whenever it is computed.</p></li>
+<li><p>Theorem <a href="#thm:tlsc:batchskew">7.3</a> applies to any batched command that validates members against the log but not against each other, and Proposition <a href="#prop:tlsc:batchfix">7.4</a> applies to batches of changesets with <span class="math inline">\(\mathsf{W}\)</span> and <span class="math inline">\(\mathsf{R}\)</span> of each member.</p></li>
+</ol>
+</div>
+<div class="proof">
+<p><em>Proof.</em> Part 1: those results use only the log, the chain and the insert-only table; objects enter Theorem <a href="#thm:tlsc:snapshot-immutability">5.6</a> only through content addressing, and <span class="math inline">\(\sigma_u(r)\)</span> is a fold over <span class="math inline">\(e_1,\dots,e_u\)</span>. Part 2: the writer reads <span class="math inline">\(\sigma_b(r)\)</span> and states <span class="math inline">\(b\)</span>; there is no second datum to disagree with it, which removes the exposure discussed after Assumption <a href="#ass:tlsc:base">6.1</a>. Part 3: the proof of Theorem <a href="#thm:tlsc:serializability">6.4</a> uses commits only to identify the entry’s write set and the state before and after the entry. With changesets, the entry’s write set is <span class="math inline">\(\mathsf{W}\)</span>, the state change is <span class="math inline">\(\Phi\)</span> on <span class="math inline">\(\mathsf{W}\)</span>, and Assumption <a href="#ass:tlsc:refine">6.2</a> holds at path granularity because <span class="math inline">\(\sigma\)</span> changes only on <span class="math inline">\(\mathsf{W}\)</span>. The serialization-graph argument is unchanged. For disjoint writes, a three-way merge with base <span class="math inline">\(\sigma_b(r)\)</span>, head <span class="math inline">\(\sigma_{v-1}(r)\)</span> and side <span class="math inline">\(\sigma_b(r)\)</span> with <span class="math inline">\(\Phi\)</span> applied takes <span class="math inline">\(\Phi\)</span> on <span class="math inline">\(\mathsf{W}\)</span> and the head elsewhere, which is the definition. Part 4: these results mention only access sets and validation outcomes. Part 5: by Assumption <a href="#ass:tlsc:projection">8.2</a>, each entry naming <span class="math inline">\(r\)</span> adds one first-parent step to the projected commit, and induction gives the chain; determinism gives the fixed identifier. Part 6: the constructive history in the proof of Theorem <a href="#thm:tlsc:batchskew">7.3</a> uses only read sets, write sets and per-member validation against the log, and the proof of Proposition <a href="#prop:tlsc:batchfix">7.4</a> uses only write-set disjointness and the read rule. ◻</p>
+</div>
+<p>The implementation at <code>dd6c9a8</code> realizes the design with two refinements. A changeset is the set of touched paths of a recorded commit, and that commit takes the changeset route only if its single parent is the branch’s projected commit at its base, so Assumption <a href="#ass:tlsc:base">6.1</a> is checked rather than assumed; anything else takes the merge path. The authority lands up to 128 pending changesets in one command, appending them one at a time, and checks each member’s touched paths and read set against the log’s path index above its base. Earlier members of the batch are already in the log when a later member is checked, so the condition of Proposition <a href="#prop:tlsc:batchfix">7.4</a> holds by construction on this path, and part 6 raises no anomaly there. The batch landing path merged at <code>fef94e7</code> submits up to 256 landings per command and states the condition explicitly: before routing a member it asks whether the member’s read set or touched paths meet the writes of members already accepted in the batch, and defers it if they do. Part 5 moves the no-lost-update guarantee from the ref table to the projection, which Part II proves deterministic in its treatment of Git as a derived view (its Lemma 13.2).</p>
+<h2 data-number="9" id="sec:tlsc:invariants"><span class="header-section-number">9</span> Formal invariants</h2>
+<p>Table <a href="#tab:tlsc:invariants">3</a> lists the invariants the platform maintains, with the result or code check that establishes each. The first thirteen are the subject of this paper. The last two concern access control and review policy; they are enforced and tested in the code but not analyzed here.</p>
+<table id="tab:tlsc:invariants">
+<caption>Invariants of the repository authority. A result number refers to this paper; a test name refers to the code at commit <code>cfa4845</code>.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Id</th>
+<th style="text-align: left;">Invariant</th>
+<th style="text-align: left;">Established by</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">I1</td>
+<td style="text-align: left;">Log versions are contiguous from 1, and every base precedes its entry.</td>
+<td style="text-align: left;">Definition <a href="#def:tlsc:log">4.10</a>, replay checks</td>
+</tr>
+<tr>
+<td style="text-align: left;">I2</td>
+<td style="text-align: left;">Each chain digest hashes the previous digest and the entry.</td>
+<td style="text-align: left;">Proposition <a href="#prop:tlsc:tamper">5.2</a>, tamper test</td>
+</tr>
+<tr>
+<td style="text-align: left;">I3</td>
+<td style="text-align: left;">Each entry’s old value equals the ref’s value before it, so the ref table equals the replay of the log.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:replay">5.1</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I4</td>
+<td style="text-align: left;">A ref move, its log entry, the projection target, any checkpoint and the landings row commit in one transaction with no network input or output.</td>
+<td style="text-align: left;">Assumption <a href="#ass:tlsc:atomic">4.14</a>, Definition <a href="#def:tlsc:append">4.16</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I5</td>
+<td style="text-align: left;">A commit identifier is the Git hash of its bytes, and every tree supplied by the adapter is verified against its identifier.</td>
+<td style="text-align: left;">Golden identifier tests and the untrusted-input test</td>
+</tr>
+<tr>
+<td style="text-align: left;">I6</td>
+<td style="text-align: left;">A commit is recorded only after the object store’s readback matches what the authority built, and a hidden ref keeps it reachable.</td>
+<td style="text-align: left;">Record command</td>
+</tr>
+<tr>
+<td style="text-align: left;">I7</td>
+<td style="text-align: left;">A read pinned at a version is unaffected by later writes.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:snapshot-immutability">5.6</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I8</td>
+<td style="text-align: left;">A landed commit has no stale declared read since its base.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:serializability">6.4</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I9</td>
+<td style="text-align: left;">A batch merge sits on the current head, is built by the platform, and changes only paths its members changed.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:combiner-safety">7.2</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I10</td>
+<td style="text-align: left;">A batch lands only under the lease’s current epoch.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:combiner-safety">7.2</a>, fenced-lease test</td>
+</tr>
+<tr>
+<td style="text-align: left;">I11</td>
+<td style="text-align: left;">Landing a commit that already landed is a no-op, and landings are unique per commit and branch.</td>
+<td style="text-align: left;">Land command, table key</td>
+</tr>
+<tr>
+<td style="text-align: left;">I12</td>
+<td style="text-align: left;">Refs only advance along first-parent chains, and repair and break-glass add commits.</td>
+<td style="text-align: left;">Theorem <a href="#thm:tlsc:forward">5.4</a></td>
+</tr>
+<tr>
+<td style="text-align: left;">I13</td>
+<td style="text-align: left;">Branch refs in the object store follow the authority, are never forced, and report a refused update as drift.</td>
+<td style="text-align: left;">Projection test</td>
+</tr>
+<tr>
+<td style="text-align: left;">I14</td>
+<td style="text-align: left;">A path outside a token’s grant is refused in the same way whether or not it exists.</td>
+<td style="text-align: left;">Directory-grant test</td>
+</tr>
+<tr>
+<td style="text-align: left;">I15</td>
+<td style="text-align: left;">An unclassified or unknown change never counts as approved.</td>
+<td style="text-align: left;">Auto-approval test</td>
+</tr>
+</tbody>
+</table>
+<p>Two gaps qualify the table. I3 is checked on replay, but a checkpoint’s ref map is trusted once its digest matches (Theorem <a href="#thm:tlsc:replay">5.1</a>). I8 holds for single landings under Assumption <a href="#ass:tlsc:base">6.1</a>, which the authority does not check for writer-supplied parents, and does not hold across members of one batch (Theorem <a href="#thm:tlsc:batchskew">7.3</a>).</p>
+<h2 data-number="10" id="sec:tlsc:evidence"><span class="header-section-number">10</span> Evidence</h2>
+<h3 data-number="10.1" id="correctness-evidence"><span class="header-section-number">10.1</span> Correctness evidence</h3>
+<p>The theorems above are proved against a model, and the model is tied to the code by the file-and-commit table in Appendix <a href="#app:tlsc:evidence">A</a>. The code’s own tests check the properties the theorems depend on. Object identifiers match identifiers computed by Git for blobs, trees and commits. The incremental tree rewrite equals a rewrite from scratch on randomly generated trees. Replay rebuilds refs and rejects a broken chain. Validation rebases disjoint writes, conflicts on overlapping reads, treats opaque ref moves as conflicts, respects path component boundaries, and lets a symbol read conflict only with writes derived to touch that symbol. The combiner fails a stale read at claim time, refuses a batch under a stale epoch, and lands two members with one merge whose parents are the head followed by the members.</p>
+<p>Table <a href="#tab:tlsc:measured">4</a> lists the measured results this paper uses, with the conditions under which each was obtained.</p>
+<table id="tab:tlsc:measured">
+<caption>Measured results used in this paper, all from the Cloudflare reference implementation. Local runs used the workerd runtime on one developer machine with simulated storage latency; hosted runs used an isolated Cloudflare deployment with the client on one developer machine.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Quantity</th>
+<th style="text-align: left;">Result</th>
+<th style="text-align: left;">Setting</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Concurrent landings without loss</td>
+<td style="text-align: left;">100 of 100 writers committed and landed on one branch of a 100-file repository</td>
+<td style="text-align: left;">Local, reported in a commit message</td>
+</tr>
+<tr>
+<td style="text-align: left;">Three-way merge against Git</td>
+<td style="text-align: left;">Agreement with <code>git merge-file</code> on 300 of 300 random merges of 20-line files</td>
+<td style="text-align: left;">Unit test</td>
+</tr>
+<tr>
+<td style="text-align: left;">Commit cost and repository size</td>
+<td style="text-align: left;">One-file commit p50 about 13 ms at 100 files and about 14 ms at 10,000 files</td>
+<td style="text-align: left;">Local, 30 edits each, reported in a commit message</td>
+</tr>
+<tr>
+<td style="text-align: left;">Commit cost and repository size</td>
+<td style="text-align: left;">One-file commit p50 1,725 ms at 100 files and 1,627 ms at 3,000 files</td>
+<td style="text-align: left;">Hosted run 1, 20 edits each</td>
+</tr>
+<tr>
+<td style="text-align: left;">Commit cost and repository size</td>
+<td style="text-align: left;">One-file commit p50 1,302 ms at 100 files and 1,085 ms at 3,000 files</td>
+<td style="text-align: left;">Hosted run 2, 20 edits each</td>
+</tr>
+<tr>
+<td style="text-align: left;">Git compatibility</td>
+<td style="text-align: left;">A clone of the projected repository returned the landed commit and its content, and passed <code>git fsck</code></td>
+<td style="text-align: left;">Hosted</td>
+</tr>
+</tbody>
+</table>
+<p>Concurrent landing lost no work in the local test that checks Corollary <a href="#cor:tlsc:nolostupdate">5.5</a>. One hundred writers each committed one new file on the same branch and landed it, and all 100 landed. The commit message reporting the run gives a landing p95 of about 450 ms and a commit p95 of about 680 ms. Like the local commit-cost figures below, these come from the commit message that reported the run, because the run’s raw output was not kept; the hosted figures in this section come from preserved raw output.</p>
+<p>Commit cost did not grow with repository size, as Proposition <a href="#prop:tlsc:rewrite">4.3</a> predicts. Locally, a one-file commit had a p50 of about 13 ms on a 100-file repository and about 14 ms on a 10,000-file repository. On the hosted deployment, the p50 was 1,725 ms at 100 files and 1,627 ms at 3,000 files in one run, and 1,302 ms and 1,085 ms in another. The hosted values measure network and object-store round trips more than the tree rewrite, and each comes from 20 edits on one client.</p>
+<h3 data-number="10.2" id="hosted-landing-behaviour"><span class="header-section-number">10.2</span> Hosted landing behaviour</h3>
+<p>The figures in this subsection come from the tree-building landing at <code>cfa4845</code>-era revisions. Under a burst of 100 concurrent landings, landing latency came from waiting on the lease and polling, not from the atomic append. In an instrumented hosted run, the direct compare-and-swap call had a p50 of 86 ms. The batch-landing call, which occurred about three times per hundred landings, had a p50 of 579 ms. By contrast, each landing request spent a summed p50 of 2.6 s in 13.6 claim attempts on average and 2.6 s in 14.6 status polls. These phase values are sums of overlapping waits, not service times, and the same run lost 7 of 100 commits to an object-store rate limit before landing began. The gap between them is still large enough to identify the next change: a completion signal pushed to waiting requests in place of polling.</p>
+<p>End-to-end landing p50 ranged from 3.5 s to 5.3 s, and p95 from 5.0 s to 6.7 s, across two earlier hosted runs of 100 concurrent writers in which all 100 commits were accepted. The first run had p50 5.3 s and p95 6.7 s; the second had p50 3.5 s and p95 5.0 s, measured from each writer’s land request.</p>
+<p>At those revisions the commit path missed its design target: across four hosted runs with 100 concurrent writers, commit p95 was between 2.8 s and 3.7 s, against a target of 1 s. Every commit waited on the Git store of the reference implementation, Cloudflare Artifacts, which accepted one receive-pack per repository at a time, and on several round trips to the authority. The first is a constraint of that product, not of the object-store primitive, whose contract is only immutable puts and gets.</p>
+<p>Later committed revisions meet the commit target, and landing became the measured problem. With 100 writers, 28 of 39 hosted runs on later committed revisions had commit p95 under 1 s, over a full range of 437 to 2,356 ms. The four runs at revision <code>4407515</code> had 437 to 753 ms and the two at <code>03821e0</code> had 638 and 805 ms. Three caveats apply. These revisions acknowledge a commit once the authority or a commit shard durably holds its objects, before the copies in R2 and Artifacts exist. The benchmarks do not record whether the deployed tree was clean. And at 1,000 writers, commit p95 was 2,643 ms in a single run with overlapping landings. Landing with 100 writers had p95 of 4.2 to 5.4 s with polling at <code>4407515</code> and 25.7 to 30.1 s with the non-polling combiner at <code>03821e0</code>, measured from a developer machine and from a Worker in one cloud region respectively. At 1,000 writers the authority refused most landings as overloaded: 980 of 1,000 with polling, and 547 of 990 plus 155 timeouts with in-memory waiters. These are negative results for the tree-building landing, and changeset landing is the response to them. Part III analyzes the write path and its capacity in its Sections 5 and 6; nothing in this paper’s analysis depends on those latencies.</p>
+<h2 data-number="11" id="sec:tlsc:related"><span class="header-section-number">11</span> Related work</h2>
+<p>The idea of a table as a log of atomic changes over immutable files comes from the lakehouse formats. Delta Lake’s paper gives the log, the checkpoints and the argument that write transactions are serializable in record order because only one writer can create each record [<a href="#bib-armbrust2020delta">3</a>], and its protocol specification fixes the naming and the rule that writers never overwrite an entry [<a href="#bib-deltaprotocol">15</a>]. Iceberg reaches the same guarantees by an atomic swap of a metadata pointer [<a href="#bib-icebergspec">21</a>]. The present design takes this structure intact and changes two things: the atomic step is a command of a serialized authority rather than a conditional write, and the conflict rules, which Delta’s paper does not specify [<a href="#bib-armbrust2020delta">3</a>], are stated explicitly over declared read and write sets.</p>
+<p>Optimistic concurrency control begins with Kung and Robinson, whose serial validation Section <a href="#sec:tlsc:occ">6</a> maps onto landing [<a href="#bib-kung1981occ">23</a>]. The serialization-graph theorem and the treatment of granularity come from Bernstein, Hadzilacos and Goodman [<a href="#bib-bhg1987">6</a>]. The isolation-level vocabulary is that of Berenson and colleagues [<a href="#bib-berenson1995critique">4</a>] and of Adya, whose graph phenomena classify the batch anomaly of Section <a href="#sec:tlsc:combiner">7</a> [<a href="#bib-adya1999thesis">1</a>], and the question of when snapshot isolation yields serializable executions is treated by Fekete and colleagues [<a href="#bib-fekete2005serializable">17</a>]. What is specific to source control is the write-write case. A database transaction that writes a row replaces it; a change to a file is a patch, and two patches to different regions of one file can both apply. The Merge outcome and Proposition <a href="#prop:tlsc:merge">6.5</a> capture this, with the three-way merge whose semantics Khanna, Kunal and Pierce formalize [<a href="#bib-khanna2007diff3">22</a>].</p>
+<p>Among source-control systems, Scion is the closest in intent: server-side changesets in a write-ahead log, refs moved by a compare-and-swap on one row, and no global merge lock [<a href="#bib-anthropic2026scion">2</a>]. Its row lives in Spanner [<a href="#bib-corbett2012spanner">10</a>]. The Scion post credits Mononoke, the server of Meta’s Sapling, with pioneering many of its techniques, in particular the Bonsai data model [<a href="#bib-anthropic2026scion">2</a>], in which a changeset records its parents and a flat list of file changes [<a href="#bib-mononokebonsai">27</a>]. Mononoke’s pushrebase is the nearest precedent for server-side landing [<a href="#bib-mononokepushrebase">28</a>]. Google’s Piper is the long-standing example of a single very large repository with a server-side source of truth [<a href="#bib-potvin2016piper">29</a>]. YonedaRepo differs from all of these in keeping Git’s objects and identifiers, so its changesets are Git commits and its trees are Git trees, and in validating declared read sets rather than file overlap alone.</p>
+<h2 data-number="12" id="sec:tlsc:limits"><span class="header-section-number">12</span> Limitations</h2>
+<p>The theorems are proved about a model. The model’s correspondence with the code was established by reading the code at one commit, not by mechanized verification or model checking, and the land, claim and lease interleavings have been tested by example, not explored exhaustively. A randomized or model-checked test of those interleavings is the strongest missing piece of evidence.</p>
+<p>The serializability guarantee is relative to declared reads. Agents may read more than they declare, and Example <a href="#ex:tlsc:skew">6.6</a> shows the consequence. Path-level reads are conservative but expensive in concurrency; symbol-level reads depend on a parser and on the soundness of derived symbol touches, which we assume rather than prove. Neither level captures semantic dependencies that cross files without a lexical reference, which is why post-land checks remain necessary.</p>
+<p>Three implementation gaps were found in the course of this analysis: writer-supplied parents are not checked against the base version (Assumption <a href="#ass:tlsc:base">6.1</a>); checkpoints are trusted on their digest alone (Theorem <a href="#thm:tlsc:replay">5.1</a>); and batch members are not validated against each other (Theorem <a href="#thm:tlsc:batchskew">7.3</a>). Each has a small fix, stated with the result that exposes it. The changeset route checks the base (first at <code>dd6c9a8</code>, Section <a href="#sec:tlsc:n11proof">8</a>) and the batch path checks members against each other (from <code>c4c8f47</code>, Section <a href="#sec:tlsc:combiner">7</a>); both are on the development branch from <code>fef94e7</code>, neither is tested on a workload that could expose the gap, and the checkpoint gap is open.</p>
+<p>The design serializes all landings, and all commit preparation, through one authority per repository. This choice keeps the atomic step simple and bounds throughput per repository; Part III (Section 6) models that bound.</p>
+<p>Changeset landing (Section <a href="#sec:tlsc:n11">3.6</a>) is merged into the development branch at <code>fef94e7</code>; apart from its one headline result and the code-evidence rows that name its revisions, every measurement and code-evidence row in this paper concerns the tree-building landing. Several features of a complete log are not built: time travel by timestamp, log compaction and retention, and splitting refs across several authorities.</p>
+<p>The performance evidence is thin. The local figures lack surviving raw output, and the hosted runs come from one client machine, with run-to-run variation large enough that no single run should be read as precise. Part III states the planned evaluation in its Section 9.</p>
+<h2 data-number="13" id="sec:tlsc:conclusion"><span class="header-section-number">13</span> Conclusion</h2>
+<p>A repository can be run as a database with a transaction log. With Git objects as the immutable data and a serialized authority as the atomic step, the main properties of the Delta design carry over with proofs: deterministic replay, immutable snapshots, and writes serializable in log order relative to what they declare they read, whenever no line-level merge is needed. Source control adds a write-write case that tables lack, and three-way merging handles it at the level of patches rather than values. The companion paper’s independence condition has a precise meaning at landing: it is the condition under which two changes land without merging regardless of which goes first, which makes it the right rule for a scheduler and the wrong rule for a validator.</p>
+<p>These results are what the transactional view of source code needs from its lowest layer. They let derived data be defined as views of a snapshot, which Part II does, and they reduce the cost of the system to the cost of one serialized authority per repository, which Part III measures. Two questions remain open. Batched landing needs one pairwise check before it is serializable; the changeset path satisfies it by construction and the merged batch path checks it explicitly, but neither has been tested on a workload that could exhibit write skew. And serializability holds only relative to declared reads, so the guarantee is as good as the read sets that agents and tools report.</p>
+<h2 class="unnumbered" id="references">References</h2>
+<div class="refitem">
+<p><span id="bib-adya1999thesis" data-label="bib-adya1999thesis"></span><strong>[1]</strong> A. Adya. Weak consistency: A generalized theory and optimistic implementations for distributed transactions. PhD thesis, Massachusetts Institute of Technology, March 1999. MIT-LCS-TR-786. <a href="https://dspace.mit.edu/handle/1721.1/149899" class="uri">https://dspace.mit.edu/handle/1721.1/149899</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-anthropic2026scion" data-label="bib-anthropic2026scion"></span><strong>[2]</strong> Nick G. and the source control team. Redesigning source control at Anthropic. Anthropic Engineering, 13 October 2026, updated 15 October 2026. <a href="https://www.anthropic.com/engineering/redesigning-source-control" class="uri">https://www.anthropic.com/engineering/redesigning-source-control</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-armbrust2020delta" data-label="bib-armbrust2020delta"></span><strong>[3]</strong> M. Armbrust, T. Das, L. Sun, B. Yavuz, S. Zhu, M. Murthy, J. Torres, H. van Hovell, A. Ionescu, A. <span>Ł</span>uszczak, M. <span>Ś</span>witakowski, M. Szafra<span>ń</span>ski, X. Li, T. Ueshin, M. Mokhtar, P. Boncz, A. Ghodsi, S. Paranjpye, P. Senster, R. Xin, and M. Zaharia. Delta Lake: High-performance ACID table storage over cloud object stores. <em>Proceedings of the VLDB Endowment</em>, 13(12):3411-3424, 2020. doi:10.14778/3415478.3415560.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-berenson1995critique" data-label="bib-berenson1995critique"></span><strong>[4]</strong> H. Berenson, P. Bernstein, J. Gray, J. Melton, E. O’Neil, and P. O’Neil. A critique of ANSI SQL isolation levels. In <em>Proceedings of the 1995 ACM SIGMOD International Conference on Management of Data</em>, pages 1-10, 1995. doi:10.1145/223784.223785.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-bernstein1966" data-label="bib-bernstein1966"></span><strong>[5]</strong> A. J. Bernstein. Analysis of programs for parallel processing. <em>IEEE Transactions on Electronic Computers</em>, EC-15(5):757-763, 1966. doi:10.1109/PGEC.1966.264565.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-bhg1987" data-label="bib-bhg1987"></span><strong>[6]</strong> P. A. Bernstein, V. Hadzilacos, and N. Goodman. <em>Concurrency Control and Recovery in Database Systems</em>. Addison-Wesley, 1987. <a href="https://www.microsoft.com/en-us/research/people/philbe/book/" class="uri">https://www.microsoft.com/en-us/research/people/philbe/book/</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-cahill2008ssi" data-label="bib-cahill2008ssi"></span><strong>[7]</strong> M. J. Cahill, U. R<span>ö</span>hm, and A. D. Fekete. Serializable isolation for snapshot databases. In <em>Proceedings of the 2008 ACM SIGMOD International Conference on Management of Data</em>, pages 729-738, 2008. doi:10.1145/1376616.1376690.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-cfdoconcepts" data-label="bib-cfdoconcepts"></span><strong>[8]</strong> Cloudflare. What are Durable Objects? Cloudflare Durable Objects documentation. <a href="https://developers.cloudflare.com/durable-objects/concepts/what-are-durable-objects/" class="uri">https://developers.cloudflare.com/durable-objects/concepts/what-are-durable-objects/</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-cfdosqlite" data-label="bib-cfdosqlite"></span><strong>[9]</strong> Cloudflare. SQLite-backed Durable Object Storage. Cloudflare Durable Objects documentation. <a href="https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/" class="uri">https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-corbett2012spanner" data-label="bib-corbett2012spanner"></span><strong>[10]</strong> J. C. Corbett, J. Dean, M. Epstein, A. Fikes, et al. Spanner: Google’s globally-distributed database. In <em>10th USENIX Symposium on Operating Systems Design and Implementation (OSDI 12)</em>, 2012. <a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" class="uri">https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-crosby2009" data-label="bib-crosby2009"></span><strong>[11]</strong> S. A. Crosby and D. S. Wallach. Efficient data structures for tamper-evident logging. In <em>Proceedings of the 18th USENIX Security Symposium</em>, 2009. <a href="https://www.usenix.org/legacy/event/sec09/tech/full_papers/crosby.pdf" class="uri">https://www.usenix.org/legacy/event/sec09/tech/full_papers/crosby.pdf</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-deltaconflictsrc" data-label="bib-deltaconflictsrc"></span><strong>[12]</strong> Delta Lake project. ConflictChecker.scala, commit d99585d. <a href="https://github.com/delta-io/delta/blob/d99585d85ad94660dcd88fd798a1d5241edebc4c/spark/src/main/scala/org/apache/spark/sql/delta/ConflictChecker.scala" class="uri">https://github.com/delta-io/delta/blob/d99585d85ad94660dcd88fd798a1d5241edebc4c/spark/src/main/scala/org/apache/spark/sql/delta/ConflictChecker.scala</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-deltadocscc" data-label="bib-deltadocscc"></span><strong>[13]</strong> Delta Lake project. Concurrency control. <a href="https://docs.delta.io/latest/concurrency-control.html" class="uri">https://docs.delta.io/latest/concurrency-control.html</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-deltaisolationsrc" data-label="bib-deltaisolationsrc"></span><strong>[14]</strong> Delta Lake project. isolationLevels.scala. <a href="https://github.com/delta-io/delta/blob/master/spark/src/main/scala/org/apache/spark/sql/delta/isolationLevels.scala" class="uri">https://github.com/delta-io/delta/blob/master/spark/src/main/scala/org/apache/spark/sql/delta/isolationLevels.scala</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-deltaprotocol" data-label="bib-deltaprotocol"></span><strong>[15]</strong> Delta Lake project. Delta transaction log protocol (PROTOCOL.md). <a href="https://github.com/delta-io/delta/blob/master/PROTOCOL.md" class="uri">https://github.com/delta-io/delta/blob/master/PROTOCOL.md</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-dewitt1984main" data-label="bib-dewitt1984main"></span><strong>[16]</strong> D. J. DeWitt, R. H. Katz, F. Olken, L. D. Shapiro, M. R. Stonebraker, and D. Wood. Implementation techniques for main memory database systems. In <em>Proceedings of the 1984 ACM SIGMOD International Conference on Management of Data</em>, pages 1-8, 1984. doi:10.1145/602259.602261.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-fekete2005serializable" data-label="bib-fekete2005serializable"></span><strong>[17]</strong> A. Fekete, D. Liarokapis, E. O’Neil, P. O’Neil, and D. Shasha. Making snapshot isolation serializable. <em>ACM Transactions on Database Systems</em>, 30(2):492-528, 2005. doi:10.1145/1071610.1071615.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-gitobjects" data-label="bib-gitobjects"></span><strong>[18]</strong> S. Chacon and B. Straub. Git internals: Git objects. In <em>Pro Git</em>, second edition. <a href="https://git-scm.com/book/en/v2/Git-Internals-Git-Objects" class="uri">https://git-scm.com/book/en/v2/Git-Internals-Git-Objects</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-gitprotocol" data-label="bib-gitprotocol"></span><strong>[19]</strong> Git project. gitprotocol-pack: How packs are transferred over-the-wire. <a href="https://git-scm.com/docs/gitprotocol-pack" class="uri">https://git-scm.com/docs/gitprotocol-pack</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-harder1984occ" data-label="bib-harder1984occ"></span><strong>[20]</strong> T. H<span>ä</span>rder. Observations on optimistic concurrency control schemes. <em>Information Systems</em>, 9(2):111-120, 1984. doi:10.1016/0306-4379(84)90020-6.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-icebergspec" data-label="bib-icebergspec"></span><strong>[21]</strong> Apache Iceberg project. Iceberg table spec. <a href="https://iceberg.apache.org/spec/" class="uri">https://iceberg.apache.org/spec/</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-khanna2007diff3" data-label="bib-khanna2007diff3"></span><strong>[22]</strong> S. Khanna, K. Kunal, and B. C. Pierce. A formal investigation of diff3. In <em>FSTTCS 2007: Foundations of Software Technology and Theoretical Computer Science</em>, Lecture Notes in Computer Science, pages 485-496. Springer, 2007. doi:10.1007/978-3-540-77050-3_40.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-kung1981occ" data-label="bib-kung1981occ"></span><strong>[23]</strong> H. T. Kung and J. T. Robinson. On optimistic methods for concurrency control. <em>ACM Transactions on Database Systems</em>, 6(2):213-226, 1981. doi:10.1145/319566.319567.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026inversion" data-label="bib-long2026inversion"></span><strong>[24]</strong> M. Long and The YonedaAI Collaboration. The inversion of software maintainability in AI-native repositories. YonedaAI Research Collective, author’s manuscript, 14 October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026partII" data-label="bib-long2026partII"></span><strong>[25]</strong> M. Long and The YonedaAI Collaboration. Partitioned derived data. Part II of <em>Source Code as a Transactional Abstraction</em>, YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026partIII" data-label="bib-long2026partIII"></span><strong>[26]</strong> M. Long and The YonedaAI Collaboration. A cloud-portable architecture for serverless Git. Part III of <em>Source Code as a Transactional Abstraction</em>, YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-mononokebonsai" data-label="bib-mononokebonsai"></span><strong>[27]</strong> Sapling project. Mononoke: Bonsai data model. <a href="https://github.com/facebook/sapling/blob/main/eden/mononoke/docs/2.1-bonsai-data-model.md" class="uri">https://github.com/facebook/sapling/blob/main/eden/mononoke/docs/2.1-bonsai-data-model.md</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-mononokepushrebase" data-label="bib-mononokepushrebase"></span><strong>[28]</strong> Sapling project. Mononoke: Pushrebase. <a href="https://github.com/facebook/sapling/blob/main/eden/mononoke/docs/4.1-pushrebase.md" class="uri">https://github.com/facebook/sapling/blob/main/eden/mononoke/docs/4.1-pushrebase.md</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-potvin2016piper" data-label="bib-potvin2016piper"></span><strong>[29]</strong> R. Potvin and J. Levenberg. Why Google stores billions of lines of code in a single repository. <em>Communications of the ACM</em>, 59(7):78-87, 2016. doi:10.1145/2854146.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-schneider1990" data-label="bib-schneider1990"></span><strong>[30]</strong> F. B. Schneider. Implementing fault-tolerant services using the state machine approach: A tutorial. <em>ACM Computing Surveys</em>, 22(4):299-319, 1990. doi:10.1145/98163.98167.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-yonedarepo" data-label="bib-yonedarepo"></span><strong>[31]</strong> M. Long. YonedaRepo source repository, branch <code>dev</code>, commit <code>cfa4845</code>, 20 October 2026. Cited by file and commit in Appendix <a href="#app:tlsc:evidence">A</a>. Private repository; not publicly available.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-zaharia2012rdd" data-label="bib-zaharia2012rdd"></span><strong>[32]</strong> M. Zaharia, M. Chowdhury, T. Das, A. Dave, J. Ma, M. McCauley, M. J. Franklin, S. Shenker, and I. Stoica. Resilient distributed datasets: A fault-tolerant abstraction for in-memory cluster computing. In <em>9th USENIX Symposium on Networked Systems Design and Implementation (NSDI 12)</em>, pages 15-28, 2012. <a href="https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia" class="uri">https://www.usenix.org/conference/nsdi12/technical-sessions/presentation/zaharia</a>.</p>
+</div>
+<h2 class="unnumbered" id="appendixmarker">APPENDIXMARKER</h2>
+<h2 data-number="14" id="app:tlsc:evidence"><span class="header-section-number">14</span> Code evidence</h2>
+<p>Table <a href="#tab:tlsc:evidence">5</a> maps each claim this paper makes about the implementation to a file in the YonedaRepo repository [<a href="#bib-yonedarepo">31</a>]. Every row can be checked by reading the named file at the commit in its row. Rows 1 to 29 use <code>cfa4845</code> on the development branch, the revision the model of Sections <a href="#sec:tlsc:framework">4</a> to <a href="#sec:tlsc:combiner">7</a> describes; rows 30 to 33 use revisions of the branch that implemented changeset landing, which is merged into the development branch at <code>fef94e7</code>. Paths are relative to the repository root; <code>core</code> abbreviates <code>backend/crates/yoneda-core/src</code>, <code>platform</code> abbreviates <code>backend/crates/yoneda-platform/src</code>, and <code>store</code> abbreviates <code>backend/crates/yoneda-platform/src/repo_store</code>.</p>
+<table id="tab:tlsc:evidence">
+<caption>Claims about the implementation and the code that shows them.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Row</th>
+<th style="text-align: left;">Claim</th>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">Commit</th>
+<th style="text-align: left;">What the code shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">Object identifiers are Git’s</td>
+<td style="text-align: left;"><code>core/git_object/id.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>hash_object</code> computes SHA-1 over the type, a space, the length, a zero byte and the data.</td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">Identifiers match Git’s own</td>
+<td style="text-align: left;"><code>core/git_object/tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;">Golden identifiers from <code>git hash-object</code>, <code>mktree</code> and <code>commit-tree</code> are reproduced by <code>object_ids_match_git</code> and <code>commits_match_git_and_expose_trailers</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;">Deltified pack entries are refused</td>
+<td style="text-align: left;"><code>core/git_object/id.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>from_pack_code</code> returns an error for pack types 6 and 7.</td>
+</tr>
+<tr>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;">Tree rewrite touches only changed directories</td>
+<td style="text-align: left;"><code>core/git_object/rewrite.rs</code>, <code>core/git_object/tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>rewrite_tree</code> rewrites directories on changed paths, and <code>rewriting_reads_only_directories_on_changed_paths</code> asserts an untouched subtree is never read.</td>
+</tr>
+<tr>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;">Log entry fields and validity rules</td>
+<td style="text-align: left;"><code>core/txlog/entry.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>TxEntry</code> holds version, base, kind, ref, old, new, paths, read set, actor, time and chain; <code>validate</code> checks the base precedes the version, qualified ref names, deletion as the only entry without a new value, no repeated path, and the chain digest.</td>
+</tr>
+<tr>
+<td style="text-align: left;">6</td>
+<td style="text-align: left;">Chain digest definition</td>
+<td style="text-align: left;"><code>core/txlog/entry.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>chain_digest</code> hashes the previous digest together with the entry stripped of its own digest.</td>
+</tr>
+<tr>
+<td style="text-align: left;">7</td>
+<td style="text-align: left;">Replay checks contiguity, chain and old values</td>
+<td style="text-align: left;"><code>core/txlog/checkpoint.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>replay</code> rejects a version gap, calls <code>validate</code> with the previous digest, and rejects an entry whose old value differs from the replayed ref.</td>
+</tr>
+<tr>
+<td style="text-align: left;">8</td>
+<td style="text-align: left;">Checkpoints every 64 versions, trusted on digest</td>
+<td style="text-align: left;"><code>store/rows.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>CHECKPOINT_EVERY</code> is 64; <code>checkpoint_at_or_before</code> accepts a checkpoint only when its digest equals the log’s digest at that version and does not recompute its ref map.</td>
+</tr>
+<tr>
+<td style="text-align: left;">9</td>
+<td style="text-align: left;">Every command runs in one transaction</td>
+<td style="text-align: left;"><code>platform/repo_store.rs</code>, <code>backend/crates/yoneda-cloudflare/src/lib.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>execute_repo_store</code> wraps dispatch in <code>db.transaction</code>; the Cloudflare store implements it with <code>transactionSync</code> and throws on an error result so the transaction rolls back.</td>
+</tr>
+<tr>
+<td style="text-align: left;">10</td>
+<td style="text-align: left;">Append writes entry, ref, projection, checkpoint and landing together</td>
+<td style="text-align: left;"><code>store/land.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>append</code> inserts the log row, upserts the ref, sets the projection target, calls <code>maybe_checkpoint</code> and inserts the landings row using only SQL calls.</td>
+</tr>
+<tr>
+<td style="text-align: left;">11</td>
+<td style="text-align: left;">Every append keeps the head as first parent or creates the ref</td>
+<td style="text-align: left;"><code>store/land.rs</code>, <code>store/land_queue.rs</code>, <code>store/break_glass.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;">The seven call sites of <code>append</code> use kinds commit, merge, revert and import only, and each checks an absent head, a first parent equal to the head, or merge parents beginning with the head.</td>
+</tr>
+<tr>
+<td style="text-align: left;">12</td>
+<td style="text-align: left;">Retried landing is a no-op</td>
+<td style="text-align: left;"><code>store/land.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>land</code> returns an already-landed result when the ref equals the commit or a landings row exists.</td>
+</tr>
+<tr>
+<td style="text-align: left;">13</td>
+<td style="text-align: left;">Validation outcomes and opaque entries</td>
+<td style="text-align: left;"><code>core/txlog/occ.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>Proposal::check</code> returns Conflict, FastForward, Rebase or Merge; <code>stale_read</code> treats path-less entries of kinds other than commit and merge as conflicts.</td>
+</tr>
+<tr>
+<td style="text-align: left;">14</td>
+<td style="text-align: left;">Overlap of paths and symbols</td>
+<td style="text-align: left;"><code>core/txlog/occ.rs</code>, <code>core/txlog/access.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>overlaps</code> compares paths at component boundaries; <code>symbols_overlap</code> compares <code>::</code> prefixes; <code>Access::overlaps</code> handles the mixed case.</td>
+</tr>
+<tr>
+<td style="text-align: left;">15</td>
+<td style="text-align: left;">Unresolved writes stay whole files</td>
+<td style="text-align: left;"><code>core/txlog/access.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>AccessSet::writes</code> keeps a path whole unless a non-empty symbol refinement exists, as the test <code>unresolved_writes_stay_whole_files</code> checks.</td>
+</tr>
+<tr>
+<td style="text-align: left;">16</td>
+<td style="text-align: left;">Independence condition both ways</td>
+<td style="text-align: left;"><code>core/txlog/access.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>independent</code> returns true only when neither write set meets the other change’s reads or writes.</td>
+</tr>
+<tr>
+<td style="text-align: left;">17</td>
+<td style="text-align: left;">Validation tests</td>
+<td style="text-align: left;"><code>core/txlog/tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;">Tests <code>independent_writes_rebase_and_overlaps_conflict</code>, <code>opaque_ref_moves_are_never_assumed_independent</code> and <code>path_overlap_respects_component_boundaries</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;">18</td>
+<td style="text-align: left;">Merge landing is verified, not recomputed</td>
+<td style="text-align: left;"><code>store/merging.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>verify</code> checks the parents, the <code>platform:merge</code> principal, the validation outcome and that the merge touches only paths the merged work touched.</td>
+</tr>
+<tr>
+<td style="text-align: left;">19</td>
+<td style="text-align: left;">Snapshot reads by version replay the log</td>
+<td style="text-align: left;"><code>store/reads.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>at</code> accepts only a version from 0 to the current version; <code>refs_at</code> replays from the nearest accepted checkpoint; no timestamp form exists.</td>
+</tr>
+<tr>
+<td style="text-align: left;">20</td>
+<td style="text-align: left;">Tampering is detected on time travel</td>
+<td style="text-align: left;"><code>store/tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>tampered_history_is_detected_on_time_travel</code> edits a log entry and expects an integrity error on a read at that version.</td>
+</tr>
+<tr>
+<td style="text-align: left;">21</td>
+<td style="text-align: left;">Combiner lease, batch size and claim</td>
+<td style="text-align: left;"><code>store/land_queue.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>LEASE_MS</code> is 30,000 and <code>BATCH</code> is 64; <code>claim</code> waits on an unexpired lease, increments the epoch, and fails stale reads at claim time.</td>
+</tr>
+<tr>
+<td style="text-align: left;">22</td>
+<td style="text-align: left;">Batch landing checks</td>
+<td style="text-align: left;"><code>store/land_queue.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>land_batch</code> refuses a stale epoch, and <code>verify_octopus</code> checks parents, principal, per-member validation against the log and changed paths, with no check between members.</td>
+</tr>
+<tr>
+<td style="text-align: left;">23</td>
+<td style="text-align: left;">Adapter defers only on merged write overlap</td>
+<td style="text-align: left;"><code>cloudflare/worker/repo-merge.ts</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>landBatch</code> defers an item whose merged paths overlap an earlier accepted item and does not compare read sets.</td>
+</tr>
+<tr>
+<td style="text-align: left;">24</td>
+<td style="text-align: left;">Combiner behaviour under test</td>
+<td style="text-align: left;"><code>store/tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>queued_landings_batch_under_a_fenced_lease</code> checks claim-time conflict, the held lease, refusal of a stale epoch and one merge landing two members.</td>
+</tr>
+<tr>
+<td style="text-align: left;">25</td>
+<td style="text-align: left;">Base consistency is not checked</td>
+<td style="text-align: left;"><code>store/prepare.rs</code>, <code>cloudflare/worker/repo-ops.ts</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>prepare</code> checks only that the base is not newer than the log; <code>commit</code> takes the base and parent from one snapshot only when the writer names a branch.</td>
+</tr>
+<tr>
+<td style="text-align: left;">26</td>
+<td style="text-align: left;">Three-way merge agrees with Git</td>
+<td style="text-align: left;"><code>backend/crates/yoneda-runtime/src/merge_interop_tests.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>three_way_merge_matches_git_merge_file</code> compares 300 random cases with <code>git merge-file</code> and asserts agreement on every case.</td>
+</tr>
+<tr>
+<td style="text-align: left;">27</td>
+<td style="text-align: left;">Post-land failures propose repairs</td>
+<td style="text-align: left;"><code>store/checks.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;">A failing check on a landed commit lists each branch it landed on for a revert proposal, and <code>record_repair</code> links the proposed commit.</td>
+</tr>
+<tr>
+<td style="text-align: left;">28</td>
+<td style="text-align: left;">Merge verification refuses a FastForward outcome on a stale parent</td>
+<td style="text-align: left;"><code>store/merging.rs</code>, <code>store/land_queue.rs</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>verify</code> accepts only Rebase or Merge outcomes; <code>verify_octopus</code> accepts FastForward only when the commit’s first parent is the head.</td>
+</tr>
+<tr>
+<td style="text-align: left;">29</td>
+<td style="text-align: left;">Platform merge commits are prepared by the authority</td>
+<td style="text-align: left;"><code>store/prepare.rs</code>, <code>cloudflare/worker/repo-merge.ts</code></td>
+<td style="text-align: left;"><code>cfa4845</code></td>
+<td style="text-align: left;"><code>prepare</code> accepts <code>merge_parent</code> and <code>merge_parents</code> and builds the tree from the parent and the change list; <code>landBatch</code> calls <code>commit</code> with the head as parent and the accepted members as merge parents.</td>
+</tr>
+<tr>
+<td style="text-align: left;">30</td>
+<td style="text-align: left;">Changeset landing validates by path index and appends in batches</td>
+<td style="text-align: left;"><code>store/changesets.rs</code></td>
+<td style="text-align: left;"><code>dd6c9a8</code></td>
+<td style="text-align: left;">On branch <code>claude/native-p95e</code>: <code>route</code> sends a commit to the changeset route only if its single parent is the projected head at its base, and checks its touched paths and read set against <code>txlog_paths</code> above that base; <code>land</code> appends up to <code>BATCH</code> = 128 members one at a time in one command.</td>
+</tr>
+<tr>
+<td style="text-align: left;">31</td>
+<td style="text-align: left;">Batch members that meet an earlier member’s writes are refused</td>
+<td style="text-align: left;"><code>store/land_queue.rs</code>, <code>store/merging.rs</code></td>
+<td style="text-align: left;"><code>c4c8f47</code></td>
+<td style="text-align: left;">On branch <code>claude/native-p95e</code>: Batch verification returns <code>WRITE_SKEW</code> when <code>BatchWrites::admits</code> finds that a member reads or writes a path an earlier accepted member wrote.</td>
+</tr>
+<tr>
+<td style="text-align: left;">32</td>
+<td style="text-align: left;">The combiner adapter on that branch still compares only merged writes</td>
+<td style="text-align: left;"><code>cloudflare/worker/repo-merge.ts</code></td>
+<td style="text-align: left;"><code>dd6c9a8</code></td>
+<td style="text-align: left;">On branch <code>claude/native-p95e</code>: <code>landBatch</code> defers an item whose merged paths overlap an earlier accepted item and does not compare read sets.</td>
+</tr>
+<tr>
+<td style="text-align: left;">33</td>
+<td style="text-align: left;">The merged batch path checks members against each other before routing</td>
+<td style="text-align: left;"><code>store/submitted.rs</code></td>
+<td style="text-align: left;"><code>fef94e7</code></td>
+<td style="text-align: left;">On the development branch: the submit command accepts at most 256 landings, keeps a <code>BatchWrites</code> set, defers a member when <code>admits</code> fails on its read set and touched paths, and otherwise calls <code>route_writing</code>, appending a changeset and recording its writes with <code>accept</code>.</td>
+</tr>
+</tbody>
+</table>
