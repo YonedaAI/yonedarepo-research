@@ -1,0 +1,6 @@
+name = "YonedaTx"
+version = "0.1.0"
+defaultTargets = ["YonedaTx"]
+
+[[lean_lib]]
+name = "YonedaTx"

@@ -38,3 +38,5 @@ reviews/*code-audit*.md
 website/.env*
 # Build copies; canonical PDFs live in papers/pdf
 papers/latex/*.pdf
+# Lean build output
+lean/.lake/
