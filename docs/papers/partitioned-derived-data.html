@@ -295,11 +295,7 @@
 <p>Within those bounds the reduce returns exact matches, in partition order and in each segment’s file order, up to the limit. Each candidate is narrowed by exact line matching on its verified blob. When matches exceed the limit, which of them are returned therefore depends on how the repository is partitioned.</p>
 <h2 data-number="7" id="sec:pdd:prefix"><span class="header-section-number">7</span> The prefix defect in the search key</h2>
 <p>The search view in the reference implementation is not consistent at every snapshot. The search map function records each file’s full path, including the partition prefix. The key of a directory partition is the bare subtree id. Listing <a href="#lst:pdd:key">1</a> shows the two lines that fix the key, from <code>plan</code> in <code>platform_derived.rs</code> and <code>repo-derived.ts</code>.</p>
-<pre id="lst:pdd:key" data-caption="The partition key in the plan (Rust) and the storage key (TypeScript) at commit \verb|cfa4845|." data-label="lst:pdd:key"><code>// backend/crates/yoneda-platform/src/platform_derived.rs, fn plan
-.map(|e| json!({ &quot;prefix&quot;: e.name, &quot;tree&quot;: e.id, &quot;key&quot;: e.id, &quot;shallow&quot;: false }))
-
-// cloudflare/worker/repo-derived.ts
-const segmentKey = (repo: string, key: string) =&gt; `derived/v1/${repo}/search/${key}`;</code></pre>
+<p>LSTBLOCK0X</p>
 <div class="proposition">
 <p><strong>Proposition 7.1</strong> (Prefix-free keys are insufficient for search). <span id="prop:pdd:prefix" data-label="prop:pdd:prefix"></span> Let <span class="math inline">\(f_{\mathrm{s}}\)</span> be the implemented search map function and <span class="math inline">\(\kappa(d,x)=\mathrm{id}(x)\)</span> the implemented key for directory partitions. If two directory partitions <span class="math inline">\((d,x)\)</span> and <span class="math inline">\((d&#39;,x)\)</span> with <span class="math inline">\(d\ne d&#39;\)</span> cover the same nonempty subtree <span class="math inline">\(x\)</span>, in one commit or in two, then <span class="math inline">\(\kappa(d,x)=\kappa(d&#39;,x)\)</span> and <span class="math inline">\(f_{\mathrm{s}}(d,x)\ne f_{\mathrm{s}}(d&#39;,x)\)</span>. So <span class="math inline">\(\kappa\)</span> is not sufficient for <span class="math inline">\(f_{\mathrm{s}}\)</span>.</p>
 </div>
@@ -888,100 +884,7 @@ const segmentKey = (repo: string, key: string) =&gt; `derived/v1/${repo}/search/
 </table>
 <h2 data-number="19" id="app:pdd:prefixtest"><span class="header-section-number">19</span> Executed check of the prefix defect</h2>
 <p>The test below was written for this Part and is not part of the YonedaRepo repository. It was run on 20 October 2026 against the crates <code>yoneda-core</code>, <code>yoneda-store</code> and <code>yoneda-platform</code> extracted with <code>git archive</code> at commit <code>cfa4845</code>, with the repository’s pinned Rust toolchain 1.99.1, as an integration test of <code>yoneda-platform</code> (<code>cargo test -p yoneda-platform --test prefix_key</code>). It calls the same Rust operations, <code>search_plan</code> and <code>index_partition</code>, that the TypeScript adapter calls, and it passes. The repository’s own Rust tests for the modules in Table <a href="#tab:pdd:tests">3</a> (<code>search</code>, <code>blame</code>, <code>txlog::access</code>, <code>txlog::scc</code> and <code>txlog::plan</code>) passed in the same extracted tree. We did not run the workerd suite.</p>
-<pre id="lst:pdd:prefixtest" data-caption="Scratch integration test of the search partition key, run against commit \verb|cfa4845|." data-label="lst:pdd:prefixtest"><code>//! Checks for the search partition key at commit cfa4845 (scratch test, not in the repository).
-use base64::{Engine, engine::general_purpose::STANDARD};
-use serde_json::{Value, json};
-use yoneda_core::git_object::{
-    FileMode, ObjectId, ObjectKind, TreeEntry, encode_tree, hash_object,
-};
-use yoneda_platform::platform_compute as compute;
-
-fn tree(entries: &amp;[(&amp;str, FileMode, ObjectId)]) -&gt; (ObjectId, Value) {
-    let list: Vec&lt;TreeEntry&gt; = entries
-        .iter()
-        .map(|(n, m, id)| TreeEntry {
-            name: (*n).into(),
-            mode: *m,
-            id: *id,
-        })
-        .collect();
-    let id = hash_object(ObjectKind::Tree, &amp;encode_tree(&amp;list).unwrap());
-    let json = entries
-        .iter()
-        .map(|(n, m, id)| json!({ &quot;name&quot;: n, &quot;type&quot;: if *m == FileMode::Tree { &quot;tree&quot; } else { &quot;blob&quot; }, &quot;id&quot;: id.hex() }))
-        .collect::&lt;Vec&lt;_&gt;&gt;();
-    (id, Value::Array(json))
-}
-
-fn partitions(root: ObjectId, trees: &amp;Value) -&gt; Vec&lt;Value&gt; {
-    compute(json!({ &quot;op&quot;: &quot;search_plan&quot;, &quot;root&quot;: root.hex(), &quot;trees&quot;: trees }))
-        .unwrap()[&quot;partitions&quot;]
-        .as_array()
-        .unwrap()
-        .clone()
-}
-
-fn segment_paths(p: &amp;Value, trees: &amp;Value, blobs: &amp;Value) -&gt; Vec&lt;String&gt; {
-    let out = compute(
-        json!({ &quot;op&quot;: &quot;index_partition&quot;, &quot;tree&quot;: p[&quot;tree&quot;], &quot;prefix&quot;: p[&quot;prefix&quot;],
-        &quot;shallow&quot;: p[&quot;shallow&quot;], &quot;trees&quot;: trees, &quot;blobs&quot;: blobs }),
-    )
-    .unwrap();
-    out[&quot;segment&quot;][&quot;files&quot;]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|f| f[&quot;path&quot;].as_str().unwrap().to_string())
-        .collect()
-}
-
-#[test]
-fn duplicate_and_renamed_directories_share_a_key_but_not_a_segment() {
-    let content = b&quot;fn retry_with_backoff() {}\n&quot;;
-    let blob = hash_object(ObjectKind::Blob, content);
-    let blobs = json!({ blob.hex(): STANDARD.encode(content) });
-    let (sub, sub_json) = tree(&amp;[(&quot;lib.rs&quot;, FileMode::Blob, blob)]);
-
-    // One commit with two identical top-level directories a/ and b/.
-    let (root, root_json) =
-        tree(&amp;[(&quot;a&quot;, FileMode::Tree, sub), (&quot;b&quot;, FileMode::Tree, sub)]);
-    let trees = json!({ root.hex(): root_json, sub.hex(): sub_json.clone() });
-    let parts = partitions(root, &amp;trees);
-    assert_eq!(parts.len(), 2);
-    assert_eq!(
-        parts[0][&quot;key&quot;], parts[1][&quot;key&quot;],
-        &quot;a/ and b/ get the same storage key&quot;
-    );
-    let (pa, pb) = (
-        segment_paths(&amp;parts[0], &amp;trees, &amp;blobs),
-        segment_paths(&amp;parts[1], &amp;trees, &amp;blobs),
-    );
-    assert_eq!(pa, vec![&quot;a/lib.rs&quot;]);
-    assert_eq!(pb, vec![&quot;b/lib.rs&quot;]);
-    assert_ne!(pa, pb, &quot;the segments under that key differ&quot;);
-
-    // A rename of src/ to lib/ with unchanged content keeps the key.
-    let (r1, r1_json) = tree(&amp;[(&quot;src&quot;, FileMode::Tree, sub)]);
-    let (r2, r2_json) = tree(&amp;[(&quot;lib&quot;, FileMode::Tree, sub)]);
-    let t1 = json!({ r1.hex(): r1_json, sub.hex(): sub_json.clone() });
-    let t2 = json!({ r2.hex(): r2_json, sub.hex(): sub_json });
-    let (p1, p2) = (partitions(r1, &amp;t1), partitions(r2, &amp;t2));
-    assert_eq!(
-        p1[0][&quot;key&quot;], p2[0][&quot;key&quot;],
-        &quot;renamed directory keeps its key&quot;
-    );
-    assert_eq!(segment_paths(&amp;p1[0], &amp;t1, &amp;blobs), vec![&quot;src/lib.rs&quot;]);
-    assert_eq!(segment_paths(&amp;p2[0], &amp;t2, &amp;blobs), vec![&quot;lib/lib.rs&quot;]);
-
-    // Repair (b): paths relative to the partition root make equal keys carry equal segments.
-    let strip = |paths: Vec&lt;String&gt;, prefix: &amp;str| -&gt; Vec&lt;String&gt; {
-        paths
-            .into_iter()
-            .map(|p| p.strip_prefix(&amp;format!(&quot;{prefix}/&quot;)).unwrap().to_string())
-            .collect()
-    };
-    assert_eq!(strip(pa, &quot;a&quot;), strip(pb, &quot;b&quot;));
-}</code></pre>
+<p>LSTBLOCK1X</p>
 <h2 class="unnumbered" id="references">References</h2>
 <div class="refitem">
 <p><span id="bib-adya1999thesis" data-label="bib-adya1999thesis"></span><strong>[1]</strong> A. Adya. <em>Weak Consistency: A Generalized Theory and Optimistic Implementations for Distributed Transactions</em>. PhD thesis, Massachusetts Institute of Technology, March 1999. MIT-LCS-TR-786. <a href="https://dspace.mit.edu/handle/1721.1/149899" class="uri">https://dspace.mit.edu/handle/1721.1/149899</a>.</p>

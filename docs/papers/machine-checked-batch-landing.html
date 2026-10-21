@@ -1,0 +1,1017 @@
+<h2 data-number="1" id="sec:mcbl:intro"><span class="header-section-number">1</span> Introduction</h2>
+<p>Source code and source control are now transactional abstractions. A repository is a database, a change is a transaction that reads part of the source and writes another part, landing a change is a commit under optimistic concurrency control, and a version is a snapshot. Part I of this series gave the transaction model behind that view and proved its properties by hand [<a href="#bib-long2026partI">10</a>]. Part II treated derived data as views maintained from the log [<a href="#bib-long2026partII">11</a>], and Part III realized the model on cloud-portable primitives and measured it [<a href="#bib-long2026partIII">12</a>]. This paper makes the core of Part I’s model machine-checked. The definitions and proofs form a Lean 4 development [<a href="#bib-demoura2021lean4">6</a>], and we present its statements here, together with the counterexamples that show where each hypothesis is needed and the corrections that the formalization forced on Part I.</p>
+<p>We argue that code is taking a step that data took first. Data lakes began as files on object stores; when concurrent writers and derived computation broke file-level semantics, the field moved to tables with a transaction log, snapshots and optimistic concurrency [<a href="#bib-armbrust2020delta">3</a>]. Agents put source control under the same pressure by multiplying concurrent writers. Scion’s published design responds in the same way, with server-side changesets recorded in a write-ahead log and a ref update by compare-and-swap on one database row [<a href="#bib-anthropic2026scion">2</a>]. A transactional foundation is useful only if its guarantees hold, and the guarantees that carry the most weight under many concurrent writers are those about batched landing.</p>
+<p>Batching is also where hand proofs are most exposed. A combiner that lands many changes in one call to the serialized authority validates each member against the committed log, but not against the other members. Part I showed that this admits write skew (Part I, Theorem 7.3) and that a pairwise rule removes it for members validated as fast-forwards or rebases (Part I, Proposition 7.4). Members validated as Merge reach the head through a three-way merge, and Part I left them outside that proposition with only a description of the merged state (Part I, Proposition 6.5). The synthesis paper then uses the pairwise rule to treat batch size as a capacity parameter with no cost in isolation [<a href="#bib-long2026synthesis">13</a>]. That conclusion depends on the rule being correct, and its reach depends on whether the rule extends to merged members.</p>
+<p>The headline theorem settles both questions in the model. Take a log in which no landing was a Conflict, and a batch accepted at its head: every member validated as FastForward, as Rebase, or as a Merge whose three-way merge with the head has no conflict path, and no member reads or writes a location that an earlier member wrote. Suppose every Merge member is patch-compatible with the head, which means that on its write set, running its transaction on the head gives its own diff applied to the head. Then the batch installs exactly the serial execution of its members in ticket order, and the serialization graph over declared reads and writes is acyclic (Theorem <a href="#thm:mcbl:sound">5.1</a>). Neither extra hypothesis can be dropped. Without the pairwise rule, the write-skew batch is accepted and equals neither serial order (Proposition <a href="#prop:mcbl:ruleneeded">5.3</a>). Patch compatibility is the exact condition for one merged member (Theorem <a href="#thm:mcbl:mergeiff">4.3</a>), and a blind write that never read the path it merged already violates it (Proposition <a href="#prop:mcbl:mergece">4.5</a>).</p>
+<p>The development proves the results the headline rests on as well. These are the frame lemma, serializability of logs whose landings are fast-forwards and rebases, the order-insensitivity of independent changes, and acyclicity of the serialization graph. It proves the laws of the three-way merge: its specification, uniqueness, commutativity, identities and idempotence. It shows that a file-level conflict between edits to disjoint lines becomes a clean merge when lines are modelled as child locations with stable keys (Theorem <a href="#thm:mcbl:lines">4.2</a>). And it asks what survives when writers read more than they declare. No landed update is lost, serializability can fail, and a sufficient condition for serializability cannot be weakened in general (Section <a href="#sec:mcbl:underdeclared">6</a>). Concrete instances show that every main hypothesis can hold nontrivially (Section <a href="#sec:mcbl:witnesses">7</a>).</p>
+<p>Formalizing changed four statements. The merge rule as Part I describes it makes two identical changes conflict, so idempotence fails. The frame lemma holds only because agreement and the write frame use different regions of the location tree. A merged landing is a serial step exactly under patch compatibility, and the two conditions one would guess first are not enough. And the premise that undeclared reads violate is coverage of true reads by declared ones, not Part I’s sound-refinement assumption. Section <a href="#sec:mcbl:findings">8</a> states each as a correction to Part I.</p>
+<p>Every result is about the model. The implementation, YonedaRepo, is first-party work by the author, and it is linked to the model only by the code-evidence appendices of Parts I and III, which rest on reading code at named commits. We therefore call the theorems machine-checked and do not call the implementation verified. The Lean sources are public in the directory <code>lean/</code> of the series repository [<a href="#bib-yonedatx">14</a>], and Appendix <a href="#app:mcbl:evidence">A</a> maps every listing in this paper to a file and line.</p>
+<p>The paper makes five contributions.</p>
+<ol>
+<li><p>A Lean 4 formalization of the concurrency core of Part I: paths and overlap, tree states and agreement, transactions with a frame condition, the log and its snapshots, validation, and file-level and line-level three-way merge (Section <a href="#sec:mcbl:model">2</a>).</p></li>
+<li><p>A machine-checked batch landing theorem that covers members validated as Merge, under a hypothesis shown to be exact, with counterexamples for each hypothesis (Sections <a href="#sec:mcbl:merge">4</a> and <a href="#sec:mcbl:batch">5</a>).</p></li>
+<li><p>Machine-checked proofs of Part I’s frame lemma, serializability theorem, merged-writes proposition, independence theorem and coarsening proposition, in the adapted forms stated in Section <a href="#sec:mcbl:single">3</a>.</p></li>
+<li><p>Results on under-declared reads: no lost update, a counterexample to serializability, a sufficient condition and its tightness (Section <a href="#sec:mcbl:underdeclared">6</a>).</p></li>
+<li><p>Four corrections to Part I found by formalizing (Section <a href="#sec:mcbl:findings">8</a>), and a statement of what the formalization leaves out (Section <a href="#sec:mcbl:limits">9</a>).</p></li>
+</ol>
+<h2 data-number="2" id="sec:mcbl:model"><span class="header-section-number">2</span> The formal model</h2>
+<p>The development uses core Lean 4 at version 4.35.0, with no library beyond the standard prelude. Each definition below is stated in the notation of Part I and then shown as the Lean source it abbreviates. Listings quote statements and definitions. Proofs are omitted, including the proof fields of structure instances such as <code>Txn.changeset</code>, except where a short proof is an argument of a definition; the documentation comments of the source are dropped. Where the model departs from Part I we say so where the definition appears, and Section <a href="#sec:mcbl:limits">9</a> collects the departures.</p>
+<h3 data-number="2.1" id="paths-and-overlap"><span class="header-section-number">2.1</span> Paths and overlap</h3>
+<div class="definition">
+<p><strong>Definition 2.1</strong> (Paths and overlap). <span id="def:mcbl:paths" data-label="def:mcbl:paths"></span> A <em>path</em> is a finite sequence of string components. For paths <span class="math inline">\(a,b\)</span>, write <span class="math inline">\(a\sqsubseteq b\)</span> when <span class="math inline">\(b=a\cdot t\)</span> for some sequence <span class="math inline">\(t\)</span>. Two paths <em>overlap</em>, <span class="math inline">\(a\bowtie b\)</span>, when <span class="math inline">\(a\sqsubseteq b\)</span> or <span class="math inline">\(b\sqsubseteq a\)</span>. An <em>access set</em> is a finite list of paths. For access sets <span class="math inline">\(X,Y\)</span>, <span class="math inline">\(X\bowtie Y\)</span> holds when some <span class="math inline">\(x\in X\)</span> and <span class="math inline">\(y\in Y\)</span> overlap, and <span class="math inline">\(X\not\bowtie Y\)</span> otherwise. The set <em>covered</em> by <span class="math inline">\(X\)</span> is <span class="math inline">\(\mathrm{cov}(X)=\{p : x\sqsubseteq p \text{ for some } x\in X\}\)</span>, and the <em>overlap region</em> of <span class="math inline">\(X\)</span> is <span class="math inline">\(\mathrm{reg}(X)=\{p : x\bowtie p \text{ for some } x\in X\}\)</span>.</p>
+</div>
+<p>This is Part I’s location tree (Part I, Definition 4.4) realized as paths. Directories, files and symbols are all nodes: a symbol entry such as <code>src/lib.rs#Policy::backoff</code> becomes the path with components <code>src</code>, <code>lib.rs</code>, <code>Policy</code> and <code>backoff</code>. Ancestry is component-wise prefix, so <code>src/a</code> is not an ancestor of <code>src/ab</code>, as in the implementation’s component-boundary test. The covered set <span class="math inline">\(\mathrm{cov}(X)\)</span> is Part I’s <span class="math inline">\(\bigcup_{x\in X}\mathrm{sub}(x)\)</span>. The overlap region <span class="math inline">\(\mathrm{reg}(X)\)</span> adds the proper ancestors of each element of <span class="math inline">\(X\)</span>.</p>
+<p>LSTBLOCK0X</p>
+<div class="lemma">
+<p><strong>Lemma 2.2</strong> (Overlap; Part I, Lemma 4.5). <span id="lem:mcbl:overlap" data-label="lem:mcbl:overlap"></span> <span class="math inline">\(a\bowtie b\)</span> if and only if some path <span class="math inline">\(x\)</span> satisfies <span class="math inline">\(a\sqsubseteq x\)</span> and <span class="math inline">\(b\sqsubseteq x\)</span>. Overlap is reflexive and symmetric, and if <span class="math inline">\(a&#39;\sqsubseteq a\)</span> and <span class="math inline">\(a\bowtie b\)</span> then <span class="math inline">\(a&#39;\bowtie b\)</span>.</p>
+</div>
+<p>LSTBLOCK1X</p>
+<div class="proof">
+<p><em>Proof.</em> If <span class="math inline">\(a\sqsubseteq b\)</span>, then <span class="math inline">\(b\)</span> is a common descendant, and symmetrically. Conversely, two ancestors of one path are comparable: by induction on <span class="math inline">\(a\)</span>, two prefixes of the same sequence agree on their common length, so one extends the other. Reflexivity and symmetry are immediate from the definition. For the last claim, if <span class="math inline">\(a\sqsubseteq b\)</span> then <span class="math inline">\(a&#39;\sqsubseteq b\)</span> by transitivity, and if <span class="math inline">\(b\sqsubseteq a\)</span> then <span class="math inline">\(a&#39;\)</span> and <span class="math inline">\(b\)</span> are both ancestors of <span class="math inline">\(a\)</span> and hence comparable. ◻</p>
+</div>
+<h3 data-number="2.2" id="states-and-agreement"><span class="header-section-number">2.2</span> States and agreement</h3>
+<div class="definition">
+<p><strong>Definition 2.3</strong> (States, agreement and confinement). <span id="def:mcbl:state" data-label="def:mcbl:state"></span> A <em>state</em> is a function <span class="math inline">\(s\)</span> from paths to <span class="math inline">\(\mathbb{N}\cup\{\bot\}\)</span>, where <span class="math inline">\(\bot\)</span> means absent and a natural number stands for a blob. Two states <em>agree</em> on an access set <span class="math inline">\(X\)</span>, written <span class="math inline">\(s\equiv_X t\)</span>, when <span class="math inline">\(s(p)=t(p)\)</span> for every <span class="math inline">\(p\in\mathrm{reg}(X)\)</span>. A state <span class="math inline">\(t\)</span> <em>changes <span class="math inline">\(s\)</span> only within</em> <span class="math inline">\(W\)</span> when <span class="math inline">\(t(p)=s(p)\)</span> for every <span class="math inline">\(p\notin\mathrm{cov}(W)\)</span>.</p>
+</div>
+<p>Agreement in the model compares more locations than Part I’s relation, because every node of the tree carries its own content. Part I gives directories no content and compares the file and symbol locations in <span class="math inline">\(\bigcup_{x\in X}\mathrm{sub}(x)\)</span> (Part I, Section 4.2). The Lean relation compares every path in <span class="math inline">\(\mathrm{reg}(X)\)</span>, including the proper ancestors of each <span class="math inline">\(x\)</span>, and the content of a node is independent of the content of its children. When the ancestors of the accessed locations carry no content, as directories do in Part I, the two relations coincide; this is an informal observation, not a Lean theorem. For an access below a file, such as a symbol or a line, the Lean relation also compares the file node, whose content the model does not derive from its children. The mappings of Part I’s results that conclude agreement are therefore adapted rather than literal.</p>
+<p>Agreement and confinement use different regions on purpose: agreement inspects <span class="math inline">\(\mathrm{reg}(X)\)</span>, while a change is confined to the smaller set <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>. Section <a href="#sec:mcbl:findings">8</a> shows that making the two regions equal breaks the frame lemma. Blobs are natural numbers so that concrete examples can be evaluated; any type with decidable equality would serve.</p>
+<p>LSTBLOCK2X</p>
+<h3 data-number="2.3" id="transactions"><span class="header-section-number">2.3</span> Transactions</h3>
+<div class="definition">
+<p><strong>Definition 2.4</strong> (Transaction). <span id="def:mcbl:txn" data-label="def:mcbl:txn"></span> A <em>transaction</em> <span class="math inline">\(c=(\mathsf{R},\mathsf{W},f)\)</span> consists of access sets <span class="math inline">\(\mathsf{R}\)</span> and <span class="math inline">\(\mathsf{W}\)</span> and a function <span class="math inline">\(f\)</span> from states to states such that</p>
+<ol>
+<li><p>(frame) <span class="math inline">\(f(s)(p)=s(p)\)</span> for every state <span class="math inline">\(s\)</span> and every <span class="math inline">\(p\notin\mathrm{cov}(\mathsf{W})\)</span>;</p></li>
+<li><p>(reads) if <span class="math inline">\(s\equiv_{\mathsf{R}\cup\mathsf{W}}t\)</span>, then <span class="math inline">\(f(s)(p)=f(t)(p)\)</span> for every <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span>.</p></li>
+</ol>
+</div>
+<p>The frame condition is Part I’s sound-refinement assumption (Part I, Assumption 6.2) for one step at path granularity. The reads condition lets written values depend on <span class="math inline">\(\mathsf{W}\)</span> as well as on <span class="math inline">\(\mathsf{R}\)</span>, which admits read-modify-write edits such as patching one line of a file. It is a weaker demand on transactions than dependence on <span class="math inline">\(\mathsf{R}\)</span> alone, so every theorem below is at least as strong as its counterpart with that stricter condition. The set <span class="math inline">\(\mathsf{R}\)</span> bounds dependence from above: nothing requires <span class="math inline">\(f\)</span> to depend on every location of <span class="math inline">\(\mathsf{R}\)</span>.</p>
+<p>LSTBLOCK3X</p>
+<div class="definition">
+<p><strong>Definition 2.5</strong> (Changeset). <span id="def:mcbl:changeset" data-label="def:mcbl:changeset"></span> For access sets <span class="math inline">\(\mathsf{R},\mathsf{W}\)</span> and a state <span class="math inline">\(\Phi\)</span> of new content, the <em>changeset</em> <span class="math inline">\(\chi(\mathsf{R},\mathsf{W},\Phi)\)</span> is the transaction with function <span class="math inline">\(s\mapsto s\triangleleft_{\mathsf{W}}\Phi\)</span>, where <span class="math inline">\((s\triangleleft_{\mathsf{W}}\Phi)(p)=\Phi(p)\)</span> for <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span> and <span class="math inline">\(s(p)\)</span> otherwise.</p>
+</div>
+<p>This is Part I’s changeset (Part I, Definition 8.1) as a transaction. It is a blind write: its result on <span class="math inline">\(\mathsf{W}\)</span> does not depend on the state it runs on, so the reads condition holds for any <span class="math inline">\(\mathsf{R}\)</span>.</p>
+<p>LSTBLOCK4X</p>
+<h3 data-number="2.4" id="the-log-and-its-snapshots"><span class="header-section-number">2.4</span> The log and its snapshots</h3>
+<div class="definition">
+<p><strong>Definition 2.6</strong> (Log and snapshots). <span id="def:mcbl:log" data-label="def:mcbl:log"></span> A <em>log entry</em> <span class="math inline">\(e=(c,b)\)</span> is a transaction and a base version. A <em>log</em> on one ref is a finite sequence <span class="math inline">\(\mathcal{L}=(e_1,\dots,e_n)\)</span> with <span class="math inline">\(e_v=(c_v,b_v)\)</span> and <span class="math inline">\(c_v=(\mathsf{R}_v,\mathsf{W}_v,f_v)\)</span>. Its <em>snapshots</em> from an initial state <span class="math inline">\(s_0\)</span> are <span class="math display">\[S_{0}=s_0,\qquad S_{v}=\mathrm{land}\bigl(S_{b&#39;},\ S_{v-1},\ f_v(S_{b&#39;})\bigr)\quad\text{with } b&#39;=\min(b_v,v-1),\]</span> where <span class="math inline">\(\mathrm{land}\)</span> is the landing merge of Definition <a href="#def:mcbl:merge">2.8</a>. The <em>later write sets</em> of a base <span class="math inline">\(b\)</span> at head <span class="math inline">\(n\)</span> are <span class="math inline">\(\mathrm{Later}(b,n)=(\mathsf{W}_v : b&lt;v\leq n)\)</span>.</p>
+</div>
+<p>Version <span class="math inline">\(v\)</span> is list position <span class="math inline">\(v-1\)</span> in Lean. A range of versions <span class="math inline">\(b&lt;u\leq v\)</span> is therefore the range of positions <span class="math inline">\(b\leq i&lt;v\)</span>, which is the form the Lean statements of the frame lemma and of later results use. The base is capped at the head, as the authority caps it at landing (Part I, Definition 4.16). Each change is computed on the snapshot at its own base, so Part I’s consistent-base assumption (Part I, Assumption 6.1) holds by construction, as it does for changesets (Part I, Proposition 8.3(2)). Commits and first parents do not appear in this log, and neither do refs other than the one it describes.</p>
+<p>LSTBLOCK5X</p>
+<p>LSTBLOCK6X</p>
+<h3 data-number="2.5" id="validation"><span class="header-section-number">2.5</span> Validation</h3>
+<div class="definition">
+<p><strong>Definition 2.7</strong> (Validation; Part I, Definition 4.15, adapted). <span id="def:mcbl:validation" data-label="def:mcbl:validation"></span> For a list <span class="math inline">\(\ell\)</span> of write sets and access sets <span class="math inline">\(\mathsf{R},\mathsf{W}\)</span>, validation returns <span class="math inline">\(\mathrm{val}(\ell,\mathsf{R},\mathsf{W})=\mathrm{Conflict}\)</span> if <span class="math inline">\(\mathsf{R}\bowtie\mathsf{W}&#39;\)</span> for some <span class="math inline">\(\mathsf{W}&#39;\)</span> in <span class="math inline">\(\ell\)</span>; otherwise <span class="math inline">\(\mathrm{FastForward}\)</span> if <span class="math inline">\(\ell\)</span> is empty; otherwise <span class="math inline">\(\mathrm{Merge}\)</span> if <span class="math inline">\(\mathsf{W}\bowtie\mathsf{W}&#39;\)</span> for some <span class="math inline">\(\mathsf{W}&#39;\)</span> in <span class="math inline">\(\ell\)</span>; and otherwise <span class="math inline">\(\mathrm{Rebase}\)</span>. Entry <span class="math inline">\(e_v\)</span> is validated against <span class="math inline">\(\mathrm{Later}(b_v,v-1)\)</span>. A log has <em>no Conflict</em> when every entry satisfies <span class="math inline">\(b_v\leq v-1\)</span> and its outcome is not <span class="math inline">\(\mathrm{Conflict}\)</span>; it is <em>clean</em> when every outcome is <span class="math inline">\(\mathrm{FastForward}\)</span> or <span class="math inline">\(\mathrm{Rebase}\)</span>.</p>
+</div>
+<p>The definition is adapted. Part I’s stale-read test uses the later entries’ refined write sets <span class="math inline">\(\mathsf{W}^\rho\)</span>, its overlap test uses the unrefined ones, and it treats opaque entries as conflicts. Here one list of write sets serves both tests and no entry is opaque. Part I’s symbol-granularity corollary (Part I, Corollary 6.8), which depends on the two granularities, is therefore not formalized.</p>
+<p>LSTBLOCK7X</p>
+<p>LSTBLOCK8X</p>
+<h3 data-number="2.6" id="three-way-merge"><span class="header-section-number">2.6</span> Three-way merge</h3>
+<div class="definition">
+<p><strong>Definition 2.8</strong> (Three-way merge and landing). <span id="def:mcbl:merge" data-label="def:mcbl:merge"></span> For values <span class="math inline">\(b,o,t\)</span>, let <span class="math inline">\(m_3(b,o,t)\)</span> be <span class="math inline">\(t\)</span> if <span class="math inline">\(o=b\)</span>; else <span class="math inline">\(o\)</span> if <span class="math inline">\(t=b\)</span>; else <span class="math inline">\(o\)</span> if <span class="math inline">\(o=t\)</span>; and a conflict otherwise. For states <span class="math inline">\(B,O,T\)</span>, the merge at <span class="math inline">\(p\)</span> is <span class="math inline">\(m_3(B(p),O(p),T(p))\)</span>, and <span class="math inline">\(p\)</span> is a <em>conflict path</em> when <span class="math inline">\(O(p)\neq B(p)\)</span>, <span class="math inline">\(T(p)\neq B(p)\)</span> and <span class="math inline">\(O(p)\neq T(p)\)</span>. The merged state <span class="math inline">\(\mathrm{M}(B,O,T)\)</span> takes the merged value at each path, with <span class="math inline">\(O(p)\)</span> at a conflict path. The landing of a change <span class="math inline">\(C\)</span> built on base <span class="math inline">\(B\)</span> onto head <span class="math inline">\(H\)</span> is <span class="math inline">\(\mathrm{land}(B,H,C)\)</span>: the merge with <span class="math inline">\(H\)</span> as ours and <span class="math inline">\(C\)</span> as theirs, with <span class="math inline">\(C(p)\)</span> at a conflict path.</p>
+</div>
+<p>The third clause, under which two sides that made the same change do not conflict, is the rule of <code>diff3</code> and Git; Section <a href="#sec:mcbl:findings">8</a> shows what fails without it. The fallback at a conflict path keeps the log total. The two fallbacks, <span class="math inline">\(O(p)\)</span> for <span class="math inline">\(\mathrm{M}\)</span> and the change’s value for <span class="math inline">\(\mathrm{land}\)</span>, never affect a result: a conflict path differs from the base on the change’s side, so it lies in the change’s write set, and every theorem about <span class="math inline">\(\mathrm{M}\)</span> assumes that no path is a conflict path. Part I’s authority refuses such landings, and no theorem below depends on the fallback beyond one property, that a landing changes the head only within the change’s write set: results about validated logs exclude conflict paths either by hypothesis or because a clean outcome has none.</p>
+<p>LSTBLOCK9X</p>
+<div class="definition">
+<p><strong>Definition 2.9</strong> (Diff). <span id="def:mcbl:diff" data-label="def:mcbl:diff"></span> For states <span class="math inline">\(B,C,H\)</span>, the diff of <span class="math inline">\(C\)</span> against <span class="math inline">\(B\)</span> applied to <span class="math inline">\(H\)</span> is <span class="math inline">\(\delta(B,C,H)(p)=C(p)\)</span> if <span class="math inline">\(C(p)\neq B(p)\)</span>, and <span class="math inline">\(H(p)\)</span> otherwise.</p>
+</div>
+<div class="lemma">
+<p><strong>Lemma 2.10</strong> (Merge as a diff). <span id="lem:mcbl:diff" data-label="lem:mcbl:diff"></span> If no path is a conflict path of <span class="math inline">\((B,H,C)\)</span>, then <span class="math inline">\(\mathrm{M}(B,H,C)=\delta(B,C,H)\)</span>.</p>
+</div>
+<p>LSTBLOCK10X</p>
+<div class="proof">
+<p><em>Proof.</em> At each path, split on whether <span class="math inline">\(H(p)=B(p)\)</span>, <span class="math inline">\(C(p)=B(p)\)</span> and <span class="math inline">\(H(p)=C(p)\)</span>. If <span class="math inline">\(C(p)=B(p)\)</span>, both sides give <span class="math inline">\(H(p)\)</span>. If <span class="math inline">\(C(p)\neq B(p)\)</span> and <span class="math inline">\(H(p)=B(p)\)</span>, both give <span class="math inline">\(C(p)\)</span>. If both differ from <span class="math inline">\(B(p)\)</span>, the absence of a conflict forces <span class="math inline">\(H(p)=C(p)\)</span>, and both give that value. ◻</p>
+</div>
+<h3 data-number="2.7" id="lines-with-stable-keys"><span class="header-section-number">2.7</span> Lines with stable keys</h3>
+<div class="definition">
+<p><strong>Definition 2.11</strong> (Lines). <span id="def:mcbl:lines" data-label="def:mcbl:lines"></span> For a file path <span class="math inline">\(f\)</span> and a line key <span class="math inline">\(\ell\)</span>, the line <span class="math inline">\(\ell\)</span> of <span class="math inline">\(f\)</span> is the child location <span class="math inline">\(f\cdot\ell\)</span>, and the line map of <span class="math inline">\(f\)</span> in <span class="math inline">\(s\)</span> is <span class="math inline">\(\ell\mapsto s(f\cdot\ell)\)</span>. A <em>file-granular conflict</em> on <span class="math inline">\(f\)</span> between <span class="math inline">\(O\)</span> and <span class="math inline">\(T\)</span> over <span class="math inline">\(B\)</span> holds when the line map of <span class="math inline">\(f\)</span> in <span class="math inline">\(O\)</span> differs from that in <span class="math inline">\(B\)</span>, the map in <span class="math inline">\(T\)</span> differs from that in <span class="math inline">\(B\)</span>, and the maps in <span class="math inline">\(O\)</span> and <span class="math inline">\(T\)</span> differ.</p>
+</div>
+<p>A file is thus a location whose children are its lines. Declared at file granularity, two edits to different lines of one file overlap; declared at line granularity, they do not. The keys are stable: inserting a line does not renumber the lines after it. Positional <code>diff3</code>, in which insertions and deletions shift line numbers and hunks must be aligned, is not modelled.</p>
+<p>LSTBLOCK11X</p>
+<h3 data-number="2.8" id="batches"><span class="header-section-number">2.8</span> Batches</h3>
+<div class="definition">
+<p><strong>Definition 2.12</strong> (Batch entry). <span id="def:mcbl:batch" data-label="def:mcbl:batch"></span> A <em>member</em> <span class="math inline">\(m=(c,B)\)</span> is a transaction and the state it was built on. Its merged change against a head <span class="math inline">\(H\)</span> is <span class="math inline">\(\mu_H(m)=\mathrm{land}(B,H,f(B))\)</span>. The <em>octopus merge</em> of states <span class="math inline">\(M_1,\dots,M_k\)</span> over <span class="math inline">\(H\)</span> is <span class="math inline">\(\mathrm{oct}(H;\,)=H\)</span> and <span class="math display">\[\mathrm{oct}(H;M_1,\dots,M_k)(p)=\begin{cases}M_1(p) &amp; \text{if } M_1(p)\neq H(p),\\ \mathrm{oct}(H;M_2,\dots,M_k)(p) &amp; \text{otherwise.}\end{cases}\]</span> The state installed by a batch <span class="math inline">\(m_1,\dots,m_k\)</span> at head <span class="math inline">\(H\)</span> is <span class="math inline">\(\mathrm{oct}(H;\mu_H(m_1),\dots,\mu_H(m_k))\)</span>.</p>
+</div>
+<p>This is the adapter’s octopus merge (Part I, Definition 7.1): each member is merged against the head, and at each path the first member whose merged change moved it wins. When the merged changes move disjoint paths, the order does not matter.</p>
+<p>LSTBLOCK12X</p>
+<div class="definition">
+<p><strong>Definition 2.13</strong> (Serial forms and the pairwise rule). <span id="def:mcbl:serial" data-label="def:mcbl:serial"></span> For members <span class="math inline">\(m_1,\dots,m_k\)</span> with <span class="math inline">\(m_i=(c_i,B_i)\)</span> and a head <span class="math inline">\(H\)</span>, <em>sequential landing</em> folds <span class="math inline">\(s\mapsto\mathrm{land}(B_i,s,f_i(B_i))\)</span> from <span class="math inline">\(H\)</span>; <em>serial execution</em> is <span class="math inline">\(f_k(\cdots f_1(H)\cdots)\)</span>; and the <em>serial merge</em> folds <span class="math inline">\(s\mapsto\mathrm{M}(B_i,s,f_i(B_i))\)</span> from <span class="math inline">\(H\)</span>. The members satisfy the <em>pairwise rule</em> when <span class="math inline">\((\mathsf{R}_j\cup\mathsf{W}_j)\not\bowtie\mathsf{W}_i\)</span> for all <span class="math inline">\(i&lt;j\)</span>.</p>
+</div>
+<p>The pairwise rule is the condition of Part I, Proposition 7.4. A member built on a log entry <span class="math inline">\((c,b)\)</span> is <span class="math inline">\((c,S_{b})\)</span>.</p>
+<p>LSTBLOCK13X</p>
+<div class="definition">
+<p><strong>Definition 2.14</strong> (Patch compatibility). <span id="def:mcbl:patchcompat" data-label="def:mcbl:patchcompat"></span> A member <span class="math inline">\(m=(c,B)\)</span> is <em>patch-compatible</em> with a state <span class="math inline">\(H\)</span>, written <span class="math inline">\(\mathrm{PC}(m,H)\)</span>, when <span class="math inline">\(f(H)(p)=\delta(B,f(B),H)(p)\)</span> for every <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span>.</p>
+</div>
+<p>Patch compatibility compares two readings of a change. The transactional reading runs <span class="math inline">\(c\)</span> on the current head. The patch reading takes the diff that <span class="math inline">\(c\)</span> made against its own base and applies it to the head. The condition says the readings agree on the write set; off the write set they agree for every transaction (Theorem <a href="#thm:mcbl:mergeiff">4.3</a>).</p>
+<p>LSTBLOCK14X</p>
+<div class="definition">
+<p><strong>Definition 2.15</strong> (Accepted batch). <span id="def:mcbl:accepted" data-label="def:mcbl:accepted"></span> Let <span class="math inline">\(\mathcal{L}\)</span> have <span class="math inline">\(n\)</span> entries and head <span class="math inline">\(H=S_{n}\)</span>. An entry <span class="math inline">\(e=(c,b)\)</span> is <em>accepted</em> at <span class="math inline">\(H\)</span> when <span class="math inline">\(b\leq n\)</span> and <span class="math inline">\(\mathrm{val}(\mathrm{Later}(b,n),\mathsf{R},\mathsf{W})\)</span> is <span class="math inline">\(\mathrm{FastForward}\)</span> or <span class="math inline">\(\mathrm{Rebase}\)</span>, or is <span class="math inline">\(\mathrm{Merge}\)</span> and no path is a conflict path of <span class="math inline">\((S_{b},H,f(S_{b}))\)</span>. A sequence of entries <span class="math inline">\(e_1,\dots,e_k\)</span> is an <em>accepted batch</em> when every <span class="math inline">\(e_i\)</span> is accepted and the pairwise rule holds in that order, which is ticket order.</p>
+</div>
+<p>Acceptance allows FastForward members, which Part I’s combiner lands alone; allowing them makes the theorems more general. A Merge member must merge without a conflict path at file granularity. Under the line model of Definition <a href="#def:mcbl:lines">2.11</a>, that includes two edits to different lines of one file (Theorem <a href="#thm:mcbl:lines">4.2</a>).</p>
+<p>LSTBLOCK15X</p>
+<h3 data-number="2.9" id="serialization-graph"><span class="header-section-number">2.9</span> Serialization graph</h3>
+<div class="definition">
+<p><strong>Definition 2.16</strong> (Declared-access serialization graph). <span id="def:mcbl:sgraph" data-label="def:mcbl:sgraph"></span> For a log, place the reads of entry <span class="math inline">\(v\)</span> at version <span class="math inline">\(b_v\)</span> and its writes at version <span class="math inline">\(v\)</span>. There is an edge <span class="math inline">\(u\to v\)</span>, for entries <span class="math inline">\(u\neq v\)</span>, when <span class="math inline">\(u&lt;v\)</span> and <span class="math inline">\(\mathsf{W}_u\bowtie\mathsf{W}_v\)</span> (write-write); or <span class="math inline">\(u\leq b_v\)</span> and <span class="math inline">\(\mathsf{W}_u\bowtie\mathsf{R}_v\)</span> (write-read); or <span class="math inline">\(b_u&lt;v\)</span> and <span class="math inline">\(\mathsf{R}_u\bowtie\mathsf{W}_v\)</span> (read-write).</p>
+</div>
+<p>This is the graph of the proof of Part I, Theorem 6.4, with operations that conflict when their accesses overlap and one is a write. Its edges come from declared sets only. A Merge landing also depends on the head at the paths it merges, and no edge records that dependence; Theorem <a href="#thm:mcbl:sound">5.1</a> takes it into account through patch compatibility instead. The Lean definition indexes entries by list position, so versions <span class="math inline">\(u\)</span> and <span class="math inline">\(v\)</span> appear as positions <span class="math inline">\(i=u-1\)</span> and <span class="math inline">\(j=v-1\)</span>: the write-read condition <span class="math inline">\(u\leq b_v\)</span> is <span class="math inline">\(i+1\leq b_v\)</span>, written <code>i + 1</code> <span class="math inline">\(\leq\)</span> <code>ej.base</code>, and the read-write condition <span class="math inline">\(b_u&lt;v\)</span> is <span class="math inline">\(b_u\leq j\)</span>, written <code>ei.base</code> <span class="math inline">\(\leq\)</span> <code>j</code>.</p>
+<p>LSTBLOCK16X</p>
+<h2 data-number="3" id="sec:mcbl:single"><span class="header-section-number">3</span> Single landings</h2>
+<p>The results of this section are Part I’s results about one landing at a time, in the adapted forms the model supports. Each is used in the batch theorem.</p>
+<div class="lemma">
+<p><strong>Lemma 3.1</strong> (Frame; Part I, Lemma 6.3). <span id="lem:mcbl:frame" data-label="lem:mcbl:frame"></span> Let <span class="math inline">\(b\leq v\)</span>. If <span class="math inline">\(X\not\bowtie\mathsf{W}_u\)</span> for every entry <span class="math inline">\(e_u\)</span> with <span class="math inline">\(b&lt;u\leq v\)</span>, then <span class="math inline">\(S_{b}\equiv_XS_{v}\)</span>.</p>
+</div>
+<p>LSTBLOCK17X</p>
+<div class="proof">
+<p><em>Proof.</em> A landing changes the head only within the change’s write set: where <span class="math inline">\(f(B)(p)=B(p)\)</span>, the merge returns the head’s value, and the frame condition gives <span class="math inline">\(f(B)(p)=B(p)\)</span> for <span class="math inline">\(p\notin\mathrm{cov}(\mathsf{W})\)</span>. By induction on <span class="math inline">\(v\)</span>, a path that no <span class="math inline">\(\mathsf{W}_u\)</span> with <span class="math inline">\(b&lt;u\leq v\)</span> covers keeps its value from <span class="math inline">\(b\)</span> to <span class="math inline">\(v\)</span>. Now let <span class="math inline">\(p\in\mathrm{reg}(X)\)</span> and suppose some <span class="math inline">\(\mathsf{W}_u\)</span> covers <span class="math inline">\(p\)</span>, with <span class="math inline">\(x\bowtie p\)</span> for <span class="math inline">\(x\in X\)</span> and <span class="math inline">\(w\sqsubseteq p\)</span> for <span class="math inline">\(w\in\mathsf{W}_u\)</span>. If <span class="math inline">\(x\sqsubseteq p\)</span>, then <span class="math inline">\(x\)</span> and <span class="math inline">\(w\)</span> are both ancestors of <span class="math inline">\(p\)</span> and are comparable; if <span class="math inline">\(p\sqsubseteq x\)</span>, then <span class="math inline">\(w\sqsubseteq x\)</span>. Either way <span class="math inline">\(X\bowtie\mathsf{W}_u\)</span>, against the hypothesis, so <span class="math inline">\(p\)</span> is covered by no later write set and keeps its value. ◻</p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 3.2</strong> (Landing outcomes; Part I, Theorem 6.4, parts 1 to 3). <span id="thm:mcbl:outcomes" data-label="thm:mcbl:outcomes"></span> Let entry <span class="math inline">\(e_{n+1}=(c,b)\)</span> have <span class="math inline">\(b\leq n\)</span>. If its outcome is not <span class="math inline">\(\mathrm{Conflict}\)</span>, then <span class="math inline">\(S_{b}\equiv_{\mathsf{R}}S_{n}\)</span>. If its outcome is <span class="math inline">\(\mathrm{FastForward}\)</span>, then <span class="math inline">\(b=n\)</span> and <span class="math inline">\(S_{n+1}=f(S_{n})\)</span>. If its outcome is <span class="math inline">\(\mathrm{Rebase}\)</span>, then <span class="math inline">\(S_{n+1}(p)=f(S_{b})(p)\)</span> for <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span> and <span class="math inline">\(S_{n+1}(p)=S_{n}(p)\)</span> otherwise.</p>
+</div>
+<p>LSTBLOCK18X</p>
+<div class="proof">
+<p><em>Proof.</em> An outcome other than <span class="math inline">\(\mathrm{Conflict}\)</span> means <span class="math inline">\(\mathsf{R}\)</span> meets no set in <span class="math inline">\(\mathrm{Later}(b,n)\)</span>, and Lemma <a href="#lem:mcbl:frame">3.1</a> with <span class="math inline">\(X=\mathsf{R}\)</span> gives the first claim. <span class="math inline">\(\mathrm{FastForward}\)</span> means <span class="math inline">\(\mathrm{Later}(b,n)\)</span> is empty; its length is <span class="math inline">\(n-b\)</span>, so <span class="math inline">\(b=n\)</span>, and a landing on its own base installs the change, because the merge with <span class="math inline">\(O=B\)</span> returns <span class="math inline">\(T\)</span>. <span class="math inline">\(\mathrm{Rebase}\)</span> means <span class="math inline">\(\mathsf{R}\cup\mathsf{W}\)</span> meets no later write set, so <span class="math inline">\(S_{b}\equiv_\mathsf{W}S_{n}\)</span> by the frame lemma. On <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span> the head therefore equals the base and the merge takes the change. Off <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span> the change equals the base and the merge takes the head. ◻</p>
+</div>
+<p>Part 2 differs from Part I’s statement, which concludes <span class="math inline">\(S_{v-1}(r)=\pi_1(c)\)</span>: commits do not appear in the model, so the statement is about versions and states instead. FastForward is defined, as in Part I, by the absence of later entries; once the base is capped, that is equivalent to a base equal to the head, which is the form Part I’s proof uses.</p>
+<div class="theorem">
+<p><strong>Theorem 3.3</strong> (Serializability relative to declared reads; Part I, Theorem 6.4). <span id="thm:mcbl:serial" data-label="thm:mcbl:serial"></span> Let <span class="math inline">\(\mathcal{L}\)</span> be clean. Then for every <span class="math inline">\(v\)</span>, <span class="math inline">\(S_{v}\)</span> equals the serial execution <span class="math inline">\(f_v(\cdots f_1(s_0)\cdots)\)</span> of the first <span class="math inline">\(v\)</span> transactions in log order; and for every entry <span class="math inline">\(e_v\)</span>, <span class="math inline">\(S_{b_v}\)</span> agrees on <span class="math inline">\(\mathsf{R}_v\)</span> with the serial execution of the first <span class="math inline">\(v-1\)</span> transactions.</p>
+</div>
+<p>LSTBLOCK19X</p>
+<div class="proof">
+<p><em>Proof.</em> The step is a lemma: if <span class="math inline">\(B\equiv_{\mathsf{R}\cup\mathsf{W}}H\)</span>, then <span class="math inline">\(\mathrm{land}(B,H,f(B))=f(H)\)</span>. On <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>, <span class="math inline">\(H(p)=B(p)\)</span>, so the merge takes <span class="math inline">\(f(B)(p)\)</span>, which equals <span class="math inline">\(f(H)(p)\)</span> by the reads condition. Off <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>, <span class="math inline">\(f(B)(p)=B(p)\)</span>, so the merge takes <span class="math inline">\(H(p)\)</span>, which equals <span class="math inline">\(f(H)(p)\)</span> by the frame condition. A clean outcome means <span class="math inline">\(\mathsf{R}_v\cup\mathsf{W}_v\)</span> meets no later write set, and the frame lemma gives <span class="math inline">\(S_{b_v}\equiv_{\mathsf{R}_v\cup\mathsf{W}_v}S_{v-1}\)</span>. Induction on <span class="math inline">\(v\)</span> then gives the first claim. For the second, the frame lemma with <span class="math inline">\(X=\mathsf{R}_v\)</span> gives <span class="math inline">\(S_{b_v}\equiv_{\mathsf{R}_v}S_{v-1}\)</span>, and <span class="math inline">\(S_{v-1}\)</span> is the serial state. ◻</p>
+</div>
+<p>The Lean proof goes through a weaker hypothesis than cleanness: every entry’s <span class="math inline">\(\mathsf{R}\cup\mathsf{W}\)</span> meets no write set landed after its base. Validation is one way to obtain it; Section <a href="#sec:mcbl:underdeclared">6</a> uses another. The theorem is a state equality. Part I proves conflict-serializability by the serializability theorem of Bernstein, Hadzilacos and Goodman [<a href="#bib-bhg1987">5</a>, Theorem 2.1]; the model proves the semantic statement directly and proves separately the direction of that theorem the argument uses (Proposition <a href="#prop:mcbl:acyclic">3.7</a>).</p>
+<div class="proposition">
+<p><strong>Proposition 3.4</strong> (Merged writes; Part I, Proposition 6.5, at file level). <span id="prop:mcbl:merged" data-label="prop:mcbl:merged"></span> For any entry <span class="math inline">\(e_{n+1}=(c,b)\)</span> with <span class="math inline">\(b\leq n\)</span>, write <span class="math inline">\(B=S_{b}\)</span>, <span class="math inline">\(H=S_{n}\)</span> and <span class="math inline">\(C=f(B)\)</span>. Then <span class="math inline">\(S_{n+1}(p)=H(p)\)</span> for <span class="math inline">\(p\notin\mathrm{cov}(\mathsf{W})\)</span>; <span class="math inline">\(S_{n+1}(p)=C(p)\)</span> for <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span> that no set in <span class="math inline">\(\mathrm{Later}(b,n)\)</span> covers; and the merge of <span class="math inline">\((B,H,C)\)</span> at every path that is not a conflict path is the value <span class="math inline">\(S_{n+1}(p)\)</span>.</p>
+</div>
+<p>LSTBLOCK20X</p>
+<div class="proof">
+<p><em>Proof.</em> The first claim is the confinement of a landing to its write set. For the second, the pointwise frame argument gives <span class="math inline">\(H(p)=B(p)\)</span>, so the merge takes <span class="math inline">\(C(p)\)</span>. For the third, the merge at a non-conflict path is a value, and the landing installs that value. ◻</p>
+</div>
+<p>The proposition holds for every landing, not only for those validated as Merge. At file granularity it is the whole of Part I’s Proposition 6.5. The case that Part I’s proposition exists for, two edits to different lines of one shared file, is Theorem <a href="#thm:mcbl:lines">4.2</a>.</p>
+<div class="theorem">
+<p><strong>Theorem 3.5</strong> (Independence; Part I, Theorem 6.7). <span id="thm:mcbl:indep" data-label="thm:mcbl:indep"></span> Changes <span class="math inline">\(c_i,c_j\)</span> satisfy <span class="math inline">\(\mathsf{W}_i\not\bowtie(\mathsf{R}_j\cup\mathsf{W}_j)\)</span> and <span class="math inline">\(\mathsf{W}_j\not\bowtie(\mathsf{R}_i\cup\mathsf{W}_i)\)</span> if and only if <span class="math inline">\(\mathrm{val}((\mathsf{W}_i),\mathsf{R}_j,\mathsf{W}_j)=\mathrm{Rebase}\)</span> and <span class="math inline">\(\mathrm{val}((\mathsf{W}_j),\mathsf{R}_i,\mathsf{W}_i)=\mathrm{Rebase}\)</span>. If they do, and both are built on base <span class="math inline">\(b\)</span> of a log with exactly <span class="math inline">\(b\)</span> entries, then landing them in either order validates the second as <span class="math inline">\(\mathrm{Rebase}\)</span>, both orders give the same state, and that state is <span class="math inline">\(f_j(f_i(S_{b}))=f_i(f_j(S_{b}))\)</span>.</p>
+</div>
+<p>LSTBLOCK21X</p>
+<p>LSTBLOCK22X</p>
+<div class="proof">
+<p><em>Proof.</em> With one later entry writing <span class="math inline">\(\mathsf{W}_i\)</span>, validation of <span class="math inline">\(c_j\)</span> returns <span class="math inline">\(\mathrm{Rebase}\)</span> exactly when <span class="math inline">\(\mathsf{R}_j\not\bowtie\mathsf{W}_i\)</span> and <span class="math inline">\(\mathsf{W}_j\not\bowtie\mathsf{W}_i\)</span>. The conjunction over both orders is the independence condition, because overlap is symmetric. For the states, <span class="math inline">\(c_i\)</span> changes only <span class="math inline">\(\mathrm{cov}(\mathsf{W}_i)\)</span>, which meets neither <span class="math inline">\(\mathsf{R}_j\)</span> nor <span class="math inline">\(\mathsf{W}_j\)</span>, so <span class="math inline">\(S_{b}\)</span> and <span class="math inline">\(f_i(S_{b})\)</span> agree on <span class="math inline">\(\mathsf{R}_j\cup\mathsf{W}_j\)</span>, and the landing step of Theorem <a href="#thm:mcbl:serial">3.3</a> installs <span class="math inline">\(f_j(f_i(S_{b}))\)</span>. The two serial orders are equal path by path: a path covered by neither write set is unchanged in both; a path covered by one is written from agreeing inputs in both orders; and no path is covered by both, since then <span class="math inline">\(\mathsf{W}_i\bowtie\mathsf{W}_j\)</span>. ◻</p>
+</div>
+<p>The equivalence is proved at the level of validation, as Part I states it. The state equality is the forward direction only, and the hypothesis that no other entry lands in between is expressed by the length of the log.</p>
+<div class="proposition">
+<p><strong>Proposition 3.6</strong> (Coarsening; Part I, Proposition 6.10). <span id="prop:mcbl:coarsen" data-label="prop:mcbl:coarsen"></span> If every access of <span class="math inline">\(\mathsf{R}\)</span>, <span class="math inline">\(\mathsf{W}\)</span> and of each later write set is replaced by an ancestor, every <span class="math inline">\(\mathrm{Conflict}\)</span> outcome stays <span class="math inline">\(\mathrm{Conflict}\)</span>, and every <span class="math inline">\(\mathrm{Merge}\)</span> outcome becomes <span class="math inline">\(\mathrm{Merge}\)</span> or <span class="math inline">\(\mathrm{Conflict}\)</span>.</p>
+</div>
+<p>LSTBLOCK23X</p>
+<div class="proof">
+<p><em>Proof.</em> By the last claim of Lemma <a href="#lem:mcbl:overlap">2.2</a>, every overlap between the original sets survives the coarsening, and each outcome test is monotone in overlap. Coarsening also preserves the emptiness of the later list, so a <span class="math inline">\(\mathrm{Merge}\)</span> cannot become <span class="math inline">\(\mathrm{FastForward}\)</span>. ◻</p>
+</div>
+<p>The development also proves that independence after coarsening implies independence before, and that the frame condition survives coarsening of <span class="math inline">\(\mathsf{W}\)</span>, which are the remaining claims of Part I’s proposition.</p>
+<div class="proposition">
+<p><strong>Proposition 3.7</strong> (Acyclic serialization graph). <span id="prop:mcbl:acyclic" data-label="prop:mcbl:acyclic"></span> If a log has no Conflict landing, every edge <span class="math inline">\(u\to v\)</span> of its serialization graph satisfies <span class="math inline">\(u&lt;v\)</span>. Hence the graph has no cycle, and log order is a topological order of it.</p>
+</div>
+<p>LSTBLOCK24X</p>
+<div class="proof">
+<p><em>Proof.</em> Write-write edges point forward by definition. A write-read edge has <span class="math inline">\(u\leq b_v&lt;v\)</span>. For a read-write edge with <span class="math inline">\(v&lt;u\)</span>, the bounds <span class="math inline">\(b_u&lt;v&lt;u\)</span> place <span class="math inline">\(\mathsf{W}_v\)</span> in <span class="math inline">\(\mathrm{Later}(b_u,u-1)\)</span>, and <span class="math inline">\(\mathsf{R}_u\bowtie\mathsf{W}_v\)</span> would make entry <span class="math inline">\(u\)</span> a Conflict. A path in the graph is therefore strictly increasing, and no position reaches itself. ◻</p>
+</div>
+<p>This is the direction of Theorem 2.1 of Bernstein, Hadzilacos and Goodman that Part I uses [<a href="#bib-bhg1987">5</a>]; the generic theorem is not formalized. The proposition needs only the absence of Conflict, so it holds for logs with Merge landings. For those, it is a statement about declared accesses and nothing more.</p>
+<h2 data-number="4" id="sec:mcbl:merge"><span class="header-section-number">4</span> Merge resolution</h2>
+<h3 data-number="4.1" id="laws-of-the-three-way-merge"><span class="header-section-number">4.1</span> Laws of the three-way merge</h3>
+<div class="proposition">
+<p><strong>Proposition 4.1</strong> (Merge laws). <span id="prop:mcbl:laws" data-label="prop:mcbl:laws"></span> For states <span class="math inline">\(B,O,T\)</span>:</p>
+<ol>
+<li><p>a path is a conflict path if and only if the merge reports a conflict there;</p></li>
+<li><p>if no path is a conflict path, <span class="math inline">\(\mathrm{M}(B,O,T)\)</span> equals <span class="math inline">\(O\)</span> where <span class="math inline">\(O\)</span> differs from <span class="math inline">\(B\)</span>, equals <span class="math inline">\(T\)</span> where <span class="math inline">\(T\)</span> differs from <span class="math inline">\(B\)</span>, and equals <span class="math inline">\(B\)</span> elsewhere;</p></li>
+<li><p>any state with the property of part 2 equals <span class="math inline">\(\mathrm{M}(B,O,T)\)</span>;</p></li>
+<li><p>the merge of <span class="math inline">\((B,O,T)\)</span> equals the merge of <span class="math inline">\((B,T,O)\)</span>, conflicts included;</p></li>
+<li><p>merging <span class="math inline">\((B,B,T)\)</span> gives <span class="math inline">\(T\)</span>, merging <span class="math inline">\((B,O,B)\)</span> gives <span class="math inline">\(O\)</span>, and merging <span class="math inline">\((B,X,X)\)</span> gives <span class="math inline">\(X\)</span>;</p></li>
+<li><p>if <span class="math inline">\(O\)</span> changes <span class="math inline">\(B\)</span> only within <span class="math inline">\(\mathsf{W}_o\)</span>, <span class="math inline">\(T\)</span> changes <span class="math inline">\(B\)</span> only within <span class="math inline">\(\mathsf{W}_t\)</span>, and <span class="math inline">\(\mathsf{W}_o\not\bowtie\mathsf{W}_t\)</span>, then no path is a conflict path.</p></li>
+</ol>
+</div>
+<p>LSTBLOCK25X</p>
+<div class="proof">
+<p><em>Proof.</em> Parts 1, 2, 4 and 5 are case analyses on the three equalities among <span class="math inline">\(B(p)\)</span>, <span class="math inline">\(O(p)\)</span> and <span class="math inline">\(T(p)\)</span> at each path. For part 3, a state with the property cannot exist when some path is a conflict path, since it would equal both <span class="math inline">\(O(p)\)</span> and <span class="math inline">\(T(p)\)</span> there; so no hypothesis is needed, and elsewhere the property fixes every value. For part 6, a conflict path differs from <span class="math inline">\(B\)</span> on both sides, so it is covered by both <span class="math inline">\(\mathsf{W}_o\)</span> and <span class="math inline">\(\mathsf{W}_t\)</span>, and two sets that cover one path meet. ◻</p>
+</div>
+<p>Uniqueness is the sense in which Part I’s description of the merged state determines it. Commutativity and idempotence hold here because a location is merged as a single value. They do not hold for positional <code>diff3</code> in general: Khanna, Kunal and Pierce show that idempotence and stability fail, and that the obvious formulations of the intuition that edits to well-separated regions never conflict are wrong [<a href="#bib-khanna2007diff3">8</a>]. The laws are therefore laws of the model’s merge, and they transfer to an implementation only as far as its merge agrees with the model’s on the inputs it sees.</p>
+<h3 data-number="4.2" id="line-level-refinement"><span class="header-section-number">4.2</span> Line-level refinement</h3>
+<div class="theorem">
+<p><strong>Theorem 4.2</strong> (Line-level refinement). <span id="thm:mcbl:lines" data-label="thm:mcbl:lines"></span> Let <span class="math inline">\(f\)</span> be a file path, and suppose that for every line key <span class="math inline">\(\ell\)</span>, <span class="math inline">\(O(f\cdot\ell)=B(f\cdot\ell)\)</span> or <span class="math inline">\(T(f\cdot\ell)=B(f\cdot\ell)\)</span>. Then for every <span class="math inline">\(\ell\)</span>, the path <span class="math inline">\(f\cdot\ell\)</span> is not a conflict path, the merge there is <span class="math inline">\(\delta(B,T,O)(f\cdot\ell)\)</span>, and <span class="math inline">\(\delta(B,T,O)(f\cdot\ell)=\delta(B,O,T)(f\cdot\ell)\)</span>.</p>
+</div>
+<p>LSTBLOCK26X</p>
+<div class="proof">
+<p><em>Proof.</em> At each line one side equals the base, so the line is not a conflict path. If <span class="math inline">\(O\)</span> equals the base there, the merge takes <span class="math inline">\(T\)</span>, which is also what <span class="math inline">\(\delta(B,T,O)\)</span> and <span class="math inline">\(\delta(B,O,T)\)</span> give. If <span class="math inline">\(T\)</span> equals the base, all three give <span class="math inline">\(O\)</span>. ◻</p>
+</div>
+<p>No hypothesis excludes a file-granular conflict, and Section <a href="#sec:mcbl:witnesses">7</a> gives a case with both: the whole-file contents differ on both sides, but each line changed on at most one side. A pair of edits declared at file granularity is then validated as Merge, and treating the file as a single location would report a conflict. With lines as child locations, the merge is clean and keeps both edits, which is Part I’s Proposition 6.5 in the case that motivates it. The theorem requires stable keys, so it says nothing about insertions that shift later lines.</p>
+<h3 data-number="4.3" id="patch-compatibility"><span class="header-section-number">4.3</span> Patch compatibility</h3>
+<div class="theorem">
+<p><strong>Theorem 4.3</strong> (Merged landing as a serial step). <span id="thm:mcbl:mergeiff" data-label="thm:mcbl:mergeiff"></span> Let <span class="math inline">\(m=(c,B)\)</span> be a member and <span class="math inline">\(H\)</span> a state such that no path is a conflict path of <span class="math inline">\((B,H,f(B))\)</span>. Then <span class="math inline">\(\mathrm{M}(B,H,f(B))=f(H)\)</span> if and only if <span class="math inline">\(\mathrm{PC}(m,H)\)</span>.</p>
+</div>
+<p>LSTBLOCK27X</p>
+<div class="proof">
+<p><em>Proof.</em> By Lemma <a href="#lem:mcbl:diff">2.10</a>, <span class="math inline">\(\mathrm{M}(B,H,f(B))=\delta(B,f(B),H)\)</span>. Off <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>, the frame condition gives <span class="math inline">\(f(B)(p)=B(p)\)</span>, so the diff returns <span class="math inline">\(H(p)\)</span>, and it gives <span class="math inline">\(f(H)(p)=H(p)\)</span>; the two sides agree for every transaction. On <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>, equality of the two sides is the definition of <span class="math inline">\(\mathrm{PC}(m,H)\)</span>. ◻</p>
+</div>
+<p>The theorem makes patch compatibility exact for a single member: a conflict-free merged landing is a serial step of its transaction precisely when the condition holds. Members validated as FastForward or Rebase never need it, and for changesets it has a direct reading.</p>
+<div class="proposition">
+<p><strong>Proposition 4.4</strong> (Clean members and changesets). <span id="prop:mcbl:pcclean" data-label="prop:mcbl:pcclean"></span> If <span class="math inline">\(B\equiv_{\mathsf{R}\cup\mathsf{W}}H\)</span>, then <span class="math inline">\(\mathrm{PC}((c,B),H)\)</span>. For a changeset, <span class="math inline">\(\mathrm{PC}((\chi(\mathsf{R},\mathsf{W},\Phi),B),H)\)</span> holds if and only if <span class="math inline">\(H(p)=B(p)\)</span> for every <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span> with <span class="math inline">\(\Phi(p)=B(p)\)</span>.</p>
+</div>
+<p>LSTBLOCK28X</p>
+<div class="proof">
+<p><em>Proof.</em> For the first claim, take <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W})\)</span>. Agreement gives <span class="math inline">\(H(p)=B(p)\)</span>, and the reads condition gives <span class="math inline">\(f(H)(p)=f(B)(p)\)</span>. The diff returns <span class="math inline">\(f(B)(p)\)</span> when the change moved <span class="math inline">\(p\)</span>, and <span class="math inline">\(H(p)=B(p)=f(B)(p)\)</span> when it did not. For the second, the changeset gives <span class="math inline">\(f(H)(p)=\Phi(p)\)</span> on <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>, and the diff gives <span class="math inline">\(\Phi(p)\)</span> where <span class="math inline">\(\Phi(p)\neq B(p)\)</span> and <span class="math inline">\(H(p)\)</span> where <span class="math inline">\(\Phi(p)=B(p)\)</span>. The two agree exactly when <span class="math inline">\(\Phi(p)=B(p)\)</span> implies <span class="math inline">\(H(p)=\Phi(p)=B(p)\)</span>. ◻</p>
+</div>
+<p>A changeset is patch-compatible when it never writes a stale base value back over a path the head moved. A changeset carries content for every path of its write set. Where that content equals the base, the change did not touch the path: the merge then keeps whatever the head holds, while running the changeset writes the base value back. The condition says these two readings never diverge. A direct consequence follows from the second claim, by a one-line argument outside Lean: if every path covered by <span class="math inline">\(\mathsf{W}\)</span> receives content different from its base content, then every conflict-free merged changeset is patch-compatible. Part I’s touched paths contain the changed paths (Part I, Definition 4.2), but equality of the two sets is not established there, so we do not claim the consequence for the implementation.</p>
+<div class="proposition">
+<p><strong>Proposition 4.5</strong> (Patch compatibility cannot be dropped). <span id="prop:mcbl:mergece" data-label="prop:mcbl:mergece"></span> There are an initial state, a one-entry log and a changeset <span class="math inline">\(m\)</span> with <span class="math inline">\(\mathsf{R}=\varnothing\)</span> such that <span class="math inline">\(m\)</span> is validated as <span class="math inline">\(\mathrm{Merge}\)</span> with no conflict path, the one-member batch <span class="math inline">\((m)\)</span> is accepted, the batch state differs from running <span class="math inline">\(m\)</span> on the head, and <span class="math inline">\(m\)</span> is not patch-compatible with the head.</p>
+</div>
+<p>LSTBLOCK29X</p>
+<div class="proof">
+<p><em>Proof.</em> Let <span class="math inline">\(x=y=0\)</span> initially. The entry <span class="math inline">\(c_x\)</span> sets <span class="math inline">\(x\)</span> to <span class="math inline">\(1\)</span> as a fast-forward, so the head has <span class="math inline">\(x=1\)</span> and <span class="math inline">\(y=0\)</span>. The changeset <span class="math inline">\(m\)</span>, built on version 0, declares <span class="math inline">\(\mathsf{W}=\{x,y\}\)</span> and <span class="math inline">\(\mathsf{R}=\varnothing\)</span>, and carries <span class="math inline">\(x=0\)</span> and <span class="math inline">\(y=1\)</span>. Its write set meets the later write <span class="math inline">\(\{x\}\)</span> and its empty read set meets nothing, so validation returns <span class="math inline">\(\mathrm{Merge}\)</span>. The change differs from its base only at <span class="math inline">\(y\)</span>, which the head did not move, so there is no conflict path, and a single member satisfies the pairwise rule. The merge keeps the head’s <span class="math inline">\(x=1\)</span> and sets <span class="math inline">\(y=1\)</span>. Running <span class="math inline">\(m\)</span> on the head gives <span class="math inline">\(x=0\)</span> and <span class="math inline">\(y=1\)</span>. Patch compatibility fails at <span class="math inline">\(x\)</span>, where <span class="math inline">\(\Phi(x)=B(x)=0\)</span> but <span class="math inline">\(H(x)=1\)</span>. Lean evaluates each claim. ◻</p>
+</div>
+<p>The example matters because it defeats the two conditions one would try first. One might expect a blind write to be safe, since it reads nothing that could be stale, and one might expect a merged path outside the read set to be safe, since no read of it can be invalidated. The member <span class="math inline">\(m\)</span> is both, and its merged landing is still not the serial execution of <span class="math inline">\(m\)</span> on the head. The landed state is arguably the one the writer wanted: it keeps <span class="math inline">\(c_x\)</span>’s update to <span class="math inline">\(x\)</span>, which <span class="math inline">\(m\)</span> never meant to change, and no update is lost. But it is not the state of any serial execution of the transactions as submitted, because the transaction <span class="math inline">\(m\)</span> says that <span class="math inline">\(x\)</span> becomes <span class="math inline">\(0\)</span>. A serializability statement about merged landings must therefore either describe them as patches, as the serial merge of Definition <a href="#def:mcbl:serial">2.13</a> does, or assume patch compatibility.</p>
+<h2 data-number="5" id="sec:mcbl:batch"><span class="header-section-number">5</span> Batch landing soundness</h2>
+<div class="theorem">
+<p><strong>Theorem 5.1</strong> (Batch landing soundness). <span id="thm:mcbl:sound" data-label="thm:mcbl:sound"></span> Let <span class="math inline">\(\mathcal{L}\)</span> be a log of <span class="math inline">\(n\)</span> entries with no Conflict landing, let <span class="math inline">\(H=S_{n}\)</span>, and let <span class="math inline">\(e_1,\dots,e_k\)</span> be an accepted batch at <span class="math inline">\(H\)</span> with <span class="math inline">\(e_i=(c_i,b_i)\)</span> and members <span class="math inline">\(m_i=(c_i,S_{b_i})\)</span>. Suppose every member validated as <span class="math inline">\(\mathrm{Merge}\)</span> is patch-compatible with <span class="math inline">\(H\)</span>. Then:</p>
+<ol>
+<li><p>the batch state <span class="math inline">\(\mathrm{oct}(H;\mu_H(m_1),\dots,\mu_H(m_k))\)</span> equals the serial execution <span class="math inline">\(f_k(\cdots f_1(H)\cdots)\)</span> of the members in ticket order;</p></li>
+<li><p>the final snapshot of the log <span class="math inline">\(\mathcal{L}\)</span> followed by <span class="math inline">\(e_1,\dots,e_k\)</span> equals the batch state;</p></li>
+<li><p>the declared-access serialization graph of that log has no cycle.</p></li>
+</ol>
+</div>
+<p>LSTBLOCK30X</p>
+<div class="proof">
+<p><em>Proof.</em> The proof has four steps, each a lemma of the development.</p>
+<p><em>Disjoint writes and no conflict paths.</em> The write half of the pairwise rule gives <span class="math inline">\(\mathsf{W}_i\not\bowtie\mathsf{W}_j\)</span> for <span class="math inline">\(i\neq j\)</span>. Every accepted member has no conflict path against <span class="math inline">\(H\)</span>: a Merge member by acceptance, and a FastForward or Rebase member because its base and <span class="math inline">\(H\)</span> agree on <span class="math inline">\(\mathsf{W}\)</span> (Theorem <a href="#thm:mcbl:outcomes">3.2</a>), so the head never moved a path the change wrote.</p>
+<p><em>The octopus merge is sequential landing.</em> With pairwise disjoint write sets, the batch state equals landing the members one at a time in ticket order. The proof is by induction on the members, at each path <span class="math inline">\(p\)</span>. If the first member does not cover <span class="math inline">\(p\)</span>, its merged change leaves <span class="math inline">\(H(p)\)</span>, and every later member sees the same head value at <span class="math inline">\(p\)</span>. If it covers <span class="math inline">\(p\)</span>, no later member does, so their merged changes keep the head at <span class="math inline">\(p\)</span>, and both sides take the first member’s value.</p>
+<p><em>Sequential landing is the serial merge.</em> Each sequential landing is conflict-free, so it installs the three-way merge. At a path that a later member writes, the earlier members left the head unchanged, so a conflict path against the intermediate state would already be one against <span class="math inline">\(H\)</span>.</p>
+<p><em>The serial merge is serial execution.</em> By induction, with patch compatibility for every member: Merge members by hypothesis, and the others by Proposition <a href="#prop:mcbl:pcclean">4.4</a>. The first member’s merge equals <span class="math inline">\(f_1(H)\)</span> by Theorem <a href="#thm:mcbl:mergeiff">4.3</a>. For a later member <span class="math inline">\(m_j\)</span>, the rule gives <span class="math inline">\((\mathsf{R}_j\cup\mathsf{W}_j)\not\bowtie\mathsf{W}_1\)</span>, and <span class="math inline">\(f_1\)</span> changes only <span class="math inline">\(\mathrm{cov}(\mathsf{W}_1)\)</span>, so <span class="math inline">\(H\)</span> and <span class="math inline">\(f_1(H)\)</span> agree on <span class="math inline">\(\mathsf{R}_j\cup\mathsf{W}_j\)</span>. Hence <span class="math inline">\(m_j\)</span> has no conflict path against <span class="math inline">\(f_1(H)\)</span>, and patch compatibility transfers: on <span class="math inline">\(\mathrm{cov}(\mathsf{W}_j)\)</span>, <span class="math inline">\(f_j(f_1(H))(p)=f_j(H)(p)=\delta(B_j,f_j(B_j),H)(p)=\delta(B_j,f_j(B_j),f_1(H))(p)\)</span>, using the reads condition, patch compatibility at <span class="math inline">\(H\)</span>, and <span class="math inline">\(f_1(H)(p)=H(p)\)</span>.</p>
+<p>For part 2, the snapshot after <span class="math inline">\(j\)</span> members of the extended log is the sequential landing of the first <span class="math inline">\(j\)</span> members on <span class="math inline">\(H\)</span>, since each member’s base lies in <span class="math inline">\(\mathcal{L}\)</span>. For part 3, the extended log has no Conflict landing: entries of <span class="math inline">\(\mathcal{L}\)</span> keep their later write sets, and member <span class="math inline">\(j\)</span> is validated against <span class="math inline">\(\mathrm{Later}_{\mathcal{L}}(b_j,n)\)</span> followed by the write sets of members <span class="math inline">\(1,\dots,j-1\)</span>, none of which meets <span class="math inline">\(\mathsf{R}_j\)</span> by the rule. Proposition <a href="#prop:mcbl:acyclic">3.7</a> then gives acyclicity. ◻</p>
+</div>
+<p>LSTBLOCK31X</p>
+<p>LSTBLOCK32X</p>
+<p>Part I appends a batch as one entry, whose read set is the union of the members’ read sets and whose base is the smallest member base (Part I, Definition 4.16). The model’s entries carry one transaction each, so it represents the batch by the members appended individually in ticket order, as Part I’s proof of Proposition 7.4(2) does, and part 2 shows that the final snapshot of that log is the state of the single batch entry. Part 3 is a statement about declared accesses. For a member validated as Merge, the dependence on the head that its three-way merge introduces is not an edge, and the serializability content for that member is part 1 together with patch compatibility.</p>
+<div class="corollary">
+<p><strong>Corollary 5.2</strong> (Merge form and clean batches). <span id="cor:mcbl:merged" data-label="cor:mcbl:merged"></span> Under the hypotheses of Theorem <a href="#thm:mcbl:sound">5.1</a> without patch compatibility, the batch state equals the serial merge of the members over <span class="math inline">\(H\)</span> in ticket order, and parts 2 and 3 hold. If every member validated as <span class="math inline">\(\mathrm{FastForward}\)</span> or <span class="math inline">\(\mathrm{Rebase}\)</span>, the batch state equals serial execution in ticket order, which is Part I, Proposition 7.4.</p>
+</div>
+<p>LSTBLOCK33X</p>
+<p>The merge form is a statement about the installed state, not by itself a serializability statement. Its first two steps use only disjoint write sets and the absence of conflict paths, so the octopus merge equals the serial merge for the write-skew batch below as well. The serial merge applies each member’s change, computed on that member’s own base, to the state so far. Patch compatibility and the read half of the rule are what turn it into serial execution of the transactions. The state equality in merge form needs only the write half of the rule; the read half is needed for serial execution and for acyclicity.</p>
+<div class="proposition">
+<p><strong>Proposition 5.3</strong> (The pairwise rule is needed; Part I, Theorem 7.3). <span id="prop:mcbl:ruleneeded" data-label="prop:mcbl:ruleneeded"></span> There is a log and a two-member batch, both members accepted and validated as <span class="math inline">\(\mathrm{Rebase}\)</span>, that violates the pairwise rule, whose batch state equals neither serial order of its members, and whose extended log has a cycle in its serialization graph.</p>
+</div>
+<p>LSTBLOCK34X</p>
+<p>LSTBLOCK35X</p>
+<p>LSTBLOCK36X</p>
+<div class="proof">
+<p><em>Proof.</em> Initially <span class="math inline">\(x=y=0\)</span>. The entry <span class="math inline">\(c_0\)</span> writes only <span class="math inline">\(z\)</span> and lands as a fast-forward. Members <span class="math inline">\(c_a\)</span> (reads <span class="math inline">\(x\)</span>, sets <span class="math inline">\(y:=x+1\)</span>) and <span class="math inline">\(c_b\)</span> (reads <span class="math inline">\(y\)</span>, sets <span class="math inline">\(x:=y+1\)</span>) are built on version 0. Each is validated against <span class="math inline">\(\mathrm{Later}=(\{z\})\)</span>, which meets neither its read set nor its write set, so both are <span class="math inline">\(\mathrm{Rebase}\)</span> and accepted. The rule fails because <span class="math inline">\(\mathsf{R}_b=\{y\}\)</span> meets <span class="math inline">\(\mathsf{W}_a=\{y\}\)</span>. The batch merges each change against the head and installs <span class="math inline">\(x=1\)</span> and <span class="math inline">\(y=1\)</span>. Serial execution in the order <span class="math inline">\(c_a,c_b\)</span> gives <span class="math inline">\(y=1\)</span> and <span class="math inline">\(x=2\)</span>; in the order <span class="math inline">\(c_b,c_a\)</span> it gives <span class="math inline">\(x=1\)</span> and <span class="math inline">\(y=2\)</span>. In the extended log, <span class="math inline">\(c_a\)</span> read <span class="math inline">\(x\)</span> at version 0 before <span class="math inline">\(c_b\)</span> wrote it at version 3, and <span class="math inline">\(c_b\)</span> read <span class="math inline">\(y\)</span> at version 0 before <span class="math inline">\(c_a\)</span> wrote it at version 2, so there are read-write edges in both directions. ◻</p>
+</div>
+<p>The cycle consists of two read-write anti-dependency edges, which is phenomenon G2-item in Adya’s classification [<a href="#bib-adya1999thesis">1</a>, Section 3.2.4], and the history has the shape of write skew A5B [<a href="#bib-berenson1995critique">4</a>]. Fekete and colleagues show that every non-serializable history under snapshot isolation contains two consecutive anti-dependency edges between concurrent transactions [<a href="#bib-fekete2005serializable">7</a>, Theorem 2.1]; this pair is the smallest instance. The development also proves Part I’s Theorem 7.3 itself for this history, including the facts that landing the two members one at a time would refuse the second as a Conflict. The history is built in the model. It is not a statement about the code at the revision Part I names, and the adapter’s rule of deferring members with overlapping merged paths is modelled as disjoint declared write sets.</p>
+<h2 data-number="6" id="sec:mcbl:underdeclared"><span class="header-section-number">6</span> Under-declared reads</h2>
+<p>Part I’s guarantees hold relative to declared reads. A writer that reads a location without declaring it gets no protection for that read. This section makes precise what survives. The transaction’s own set <span class="math inline">\(\mathsf{R}\)</span> now stands for its true read set <span class="math inline">\(\mathsf{R}^{*}\)</span>, and validation uses a separately declared set <span class="math inline">\(D_v\)</span> for each entry, which may miss part of <span class="math inline">\(\mathsf{R}^{*}\)</span>.</p>
+<div class="definition">
+<p><strong>Definition 6.1</strong> (Declared reads and the write check). <span id="def:mcbl:underdeclared" data-label="def:mcbl:underdeclared"></span> A log is <em>validated with declared sets</em> <span class="math inline">\(D\)</span> when every entry has <span class="math inline">\(b_v\leq v-1\)</span> and <span class="math inline">\(\mathrm{val}(\mathrm{Later}(b_v,v-1),D_v,\mathsf{W}_v)\)</span> is <span class="math inline">\(\mathrm{FastForward}\)</span> or <span class="math inline">\(\mathrm{Rebase}\)</span>. A log passes the <em>write check</em> when every entry has <span class="math inline">\(b_v\leq v-1\)</span> and no conflict path of <span class="math inline">\((S_{b_v},S_{v-1},f_v(S_{b_v}))\)</span>. The <em>undeclared part</em> of a true read set is <span class="math inline">\(\mathsf{R}^{*}\setminus D\)</span>.</p>
+</div>
+<p>Validation with any declared sets implies the write check, because a clean outcome means that the head agrees with the base on the write set.</p>
+<p>LSTBLOCK37X</p>
+<div class="theorem">
+<p><strong>Theorem 6.2</strong> (No lost update). <span id="thm:mcbl:udnlu" data-label="thm:mcbl:udnlu"></span> Under the write check, a landing that changes the head at <span class="math inline">\(p\)</span> writes <span class="math inline">\(p\)</span> from a base that held the head’s value at <span class="math inline">\(p\)</span>. Hence, for <span class="math inline">\(i\leq v\)</span>, either <span class="math inline">\(S_{v}(p)=S_{i}(p)\)</span>, or some entry <span class="math inline">\(u\)</span> with <span class="math inline">\(i&lt;u\leq v\)</span> covers <span class="math inline">\(p\)</span>, has <span class="math inline">\(S_{b_u}(p)=S_{u-1}(p)\)</span>, and changes <span class="math inline">\(p\)</span>.</p>
+</div>
+<p>LSTBLOCK38X</p>
+<div class="proof">
+<p><em>Proof.</em> If the landing at <span class="math inline">\(u\)</span> changes <span class="math inline">\(p\)</span>, the change must differ from its base at <span class="math inline">\(p\)</span>, since otherwise the merge keeps the head; the frame condition then puts <span class="math inline">\(p\)</span> in <span class="math inline">\(\mathrm{cov}(\mathsf{W}_u)\)</span>. If the head had also moved <span class="math inline">\(p\)</span> away from the base, the absence of a conflict path would force the head and the change to agree at <span class="math inline">\(p\)</span>, and the merge would again keep the head. So the base held the head’s value. The second claim follows by induction on <span class="math inline">\(v\)</span>. ◻</p>
+</div>
+<p>No read set appears in the hypothesis. The file-level write check alone ensures that a value is replaced only by a landing whose base saw it, which is the absence of lost updates in the sense of phenomenon P4 [<a href="#bib-berenson1995critique">4</a>]. The comparison is by value, not by version, so a history in which a path returns to an earlier value between the base and the head counts as seen.</p>
+<div class="proposition">
+<p><strong>Proposition 6.3</strong> (Serializability can fail). <span id="prop:mcbl:udce" data-label="prop:mcbl:udce"></span> There is a two-entry log, validated with declared sets and passing the write check, whose undeclared reads meet an intervening write and whose final state equals neither serial order. Validated with its true read set, the second entry would be a Conflict.</p>
+</div>
+<p>LSTBLOCK39X</p>
+<div class="proof">
+<p><em>Proof.</em> Use the write-skew transactions. The entry <span class="math inline">\(c_b\)</span> (declares and reads <span class="math inline">\(y\)</span>, sets <span class="math inline">\(x:=y+1\)</span>) lands first, then <span class="math inline">\(c_a\)</span> (reads <span class="math inline">\(x\)</span>, declares nothing, sets <span class="math inline">\(y:=x+1\)</span>), both built on version 0. Validation of <span class="math inline">\(c_a\)</span> against <span class="math inline">\(\mathrm{Later}=(\{x\})\)</span> with <span class="math inline">\(D=\varnothing\)</span> returns <span class="math inline">\(\mathrm{Rebase}\)</span>. The final state is <span class="math inline">\(x=1\)</span>, <span class="math inline">\(y=1\)</span>, while the serial orders give <span class="math inline">\(y=2\)</span> or <span class="math inline">\(x=2\)</span>. With <span class="math inline">\(\mathsf{R}=\{x\}\)</span>, validation of <span class="math inline">\(c_a\)</span> returns <span class="math inline">\(\mathrm{Conflict}\)</span>. ◻</p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 6.4</strong> (A sufficient condition). <span id="thm:mcbl:udsafe" data-label="thm:mcbl:udsafe"></span> Let a log be validated with declared sets <span class="math inline">\(D\)</span>. If, for every entry <span class="math inline">\(e_v\)</span>, the undeclared part <span class="math inline">\(\mathsf{R}^{*}_v\setminus D_v\)</span> meets no set in <span class="math inline">\(\mathrm{Later}(b_v,v-1)\)</span>, then the conclusions of Theorem <a href="#thm:mcbl:serial">3.3</a> hold for the true read sets.</p>
+</div>
+<p>LSTBLOCK40X</p>
+<div class="proof">
+<p><em>Proof.</em> It suffices that each entry’s <span class="math inline">\(\mathsf{R}^{*}_v\cup\mathsf{W}_v\)</span> meets no later write set, the hypothesis through which the proof of Theorem <a href="#thm:mcbl:serial">3.3</a> goes. The write set meets none because the outcome is clean. A true read <span class="math inline">\(x\)</span> that meets a later write set is either declared, which validation refuses, or undeclared, which the hypothesis excludes. ◻</p>
+</div>
+<div class="theorem">
+<p><strong>Theorem 6.5</strong> (Tightness). <span id="thm:mcbl:udtight" data-label="thm:mcbl:udtight"></span> Let <span class="math inline">\(\mathsf{R}^{*},D,\mathsf{W}_i,\mathsf{W}_j\)</span> be access sets with <span class="math inline">\(\mathsf{W}_j\)</span> non-empty, such that <span class="math inline">\(\mathsf{R}^{*}\setminus D\)</span> meets <span class="math inline">\(\mathsf{W}_i\)</span> while <span class="math inline">\(D\)</span> and <span class="math inline">\(\mathsf{W}_j\)</span> do not. Then there are transactions <span class="math inline">\(c_i\)</span> with write set <span class="math inline">\(\mathsf{W}_i\)</span> and <span class="math inline">\(c_j\)</span> with true read set <span class="math inline">\(\mathsf{R}^{*}\)</span> and write set <span class="math inline">\(\mathsf{W}_j\)</span> such that the log <span class="math inline">\((c_i,0),(c_j,0)\)</span> is validated with declared sets <span class="math inline">\((\varnothing,D)\)</span> and its final state equals neither serial order.</p>
+</div>
+<p>LSTBLOCK41X</p>
+<div class="proof">
+<p><em>Proof.</em> Choose <span class="math inline">\(p\in\mathrm{cov}(\mathsf{W}_i)\cap\mathrm{reg}(\mathsf{R}^{*})\)</span>, which exists because an undeclared read meets <span class="math inline">\(\mathsf{W}_i\)</span>, and let <span class="math inline">\(q\)</span> be the first element of <span class="math inline">\(\mathsf{W}_j\)</span>. Since <span class="math inline">\(\mathsf{W}_j\not\bowtie\mathsf{W}_i\)</span>, <span class="math inline">\(\mathsf{W}_j\)</span> does not cover <span class="math inline">\(p\)</span>. Let <span class="math inline">\(c_i\)</span> set <span class="math inline">\(p:=q+1\)</span> and <span class="math inline">\(c_j\)</span> set <span class="math inline">\(q:=p+1\)</span>, starting from the empty state. Validation of <span class="math inline">\(c_j\)</span> against <span class="math inline">\((\mathsf{W}_i)\)</span> with declared set <span class="math inline">\(D\)</span> returns <span class="math inline">\(\mathrm{Rebase}\)</span>, the landed state has <span class="math inline">\(p=1\)</span> and <span class="math inline">\(q=1\)</span>, and the serial orders give <span class="math inline">\(q=2\)</span> and <span class="math inline">\(p=2\)</span> respectively. ◻</p>
+</div>
+<p>The tightness result is existential. Whenever the sufficient condition fails in the stated way, some transactions with exactly those sets break serializability. It does not say that every such transaction does: a particular transaction whose true read is irrelevant to its output may remain serializable, because the read set bounds dependence from above. Theorem <a href="#thm:mcbl:udsafe">6.4</a> therefore gives the weakest sufficient condition on access sets alone. It does not characterize the serializable histories of particular transactions.</p>
+<h2 data-number="7" id="sec:mcbl:witnesses"><span class="header-section-number">7</span> Non-vacuity</h2>
+<p>A theorem whose hypotheses can never hold is true and says nothing. The risk is real here. With a file modelled as one location, two different edits to one file always conflict, so a conflict-free Merge member could only be degenerate: identical changes on both sides, or declared sets that overlap while the changes touch different locations. An earlier version of the development had no constructed accepted batch at all, and the adversarial review of that version (Section <a href="#sec:mcbl:tcb">10</a>) observed that the headline’s hypotheses were satisfiable only on paper. The witnesses below are closed Lean proofs that the hypotheses of the main positive theorems hold in nontrivial instances, with non-empty logs, bases below the head, and a Merge member that combines two edits to one file.</p>
+<p>The line-level witness has a file <span class="math inline">\(F\)</span> with lines <span class="math inline">\(F/1=10\)</span> and <span class="math inline">\(F/2=20\)</span>, and a second file <span class="math inline">\(G\)</span>. The entry <span class="math inline">\(c_0\)</span> sets <span class="math inline">\(F/1:=11\)</span> and declares the whole file <span class="math inline">\(F\)</span>; it lands as a fast-forward. The member <span class="math inline">\(m_1\)</span>, built on version 0, sets <span class="math inline">\(F/2:=21\)</span> and also declares <span class="math inline">\(F\)</span>. Validated against <span class="math inline">\(c_0\)</span>, it is a Merge. The file-granular merge of <span class="math inline">\(F\)</span> conflicts, since both sides changed <span class="math inline">\(F\)</span> to different contents, but no path is a conflict path, each line is unchanged on one side, and the landing keeps both edits. Declared at line granularity, the same pair would be a Rebase.</p>
+<p>LSTBLOCK42X</p>
+<p>The batch witness adds a member <span class="math inline">\(m_2\)</span> that reads <span class="math inline">\(G\)</span> and increments it. The batch <span class="math inline">\((m_1,m_2)\)</span> is accepted at the head of the log <span class="math inline">\((c_0)\)</span>: <span class="math inline">\(m_1\)</span> is a conflict-free Merge, and <span class="math inline">\(m_2\)</span>, which neither reads nor writes <span class="math inline">\(F\)</span>, validates cleanly. The Merge member is patch-compatible, because the patch never sets a line to its base content. Theorem <a href="#thm:mcbl:sound">5.1</a> applies, and the batch state equals serial execution, with <span class="math inline">\(F/1=11\)</span>, <span class="math inline">\(F/2=21\)</span> and <span class="math inline">\(G=1\)</span>.</p>
+<p>LSTBLOCK43X</p>
+<p>Three smaller witnesses use the log <span class="math inline">\((c_0,m_2)\)</span> in which <span class="math inline">\(m_2\)</span> is built on version 0 and lands at version 2 as a Rebase. The log is clean, so Theorem <a href="#thm:mcbl:serial">3.3</a> applies with a base below its version. Between versions 0 and 1 the file <span class="math inline">\(F\)</span> changes while the snapshots agree on <span class="math inline">\(G\)</span>; the proof obtains the agreement from the frame lemma, because <span class="math inline">\(G\)</span> meets no write set in between. And with <span class="math inline">\(m_2\)</span>’s read of <span class="math inline">\(G\)</span> undeclared, the log validated with empty declared sets equals serial execution; the proof obtains this from Theorem <a href="#thm:mcbl:udsafe">6.4</a>, after checking that the undeclared read meets no later write. In both cases the premise is established inside the proof, and the statement records the conclusion.</p>
+<p>LSTBLOCK44X</p>
+<p>The counterexamples of Propositions <a href="#prop:mcbl:mergece">4.5</a>, <a href="#prop:mcbl:ruleneeded">5.3</a> and <a href="#prop:mcbl:udce">6.3</a> are concrete histories as well. Each is evaluated by the Lean kernel, and each establishes its hypotheses, such as acceptance and validation outcomes, as part of its statement.</p>
+<h2 data-number="8" id="sec:mcbl:findings"><span class="header-section-number">8</span> Findings from the formalization</h2>
+<p>Four statements changed when the model was written down in Lean. Each corrects or sharpens a statement of Part I.</p>
+<h3 data-number="8.1" id="the-merge-rule-and-idempotence"><span class="header-section-number">8.1</span> The merge rule and idempotence</h3>
+<p>Part I’s proof of its Theorem 6.4 describes the three-way merge as taking, at each path, the side that differs from the base. The first formal definition followed that description: take theirs if ours equals the base, ours if theirs equals the base, and a conflict otherwise. Under that rule, merging two identical changes is a conflict at every path where they differ from the base, so the merge of <span class="math inline">\((B,X,X)\)</span> is not <span class="math inline">\(X\)</span> and idempotence fails. The corrected rule adds the clause of <code>diff3</code> and Git: when both sides made the same change, the result is that change. With it, a path is a conflict exactly when both sides changed it to different values (Proposition <a href="#prop:mcbl:laws">4.1</a>, part 1), which is how <code>diff3</code> and Git characterize a conflict. The failure under the first rule is a one-line computation and is not a Lean theorem; the development contains only the corrected rule. Part I’s results do not depend on the missing clause, because in the case its proof treats only one side differs from the base. The description in that proof should nevertheless read: the side that differs from the base, or the common value when both sides made the same change. Two agents that apply the same fix to one file would otherwise be told they conflict.</p>
+<h3 data-number="8.2" id="the-frame-lemma-and-its-two-regions"><span class="header-section-number">8.2</span> The frame lemma and its two regions</h3>
+<p>Part I states the frame lemma with agreement on <span class="math inline">\(\bigcup_{x\in X}\mathrm{sub}(x)\)</span> and confines each landing’s changes to <span class="math inline">\(\bigcup_{w\in\mathsf{W}}\mathrm{sub}(w)\)</span> (Part I, Lemma 6.3 and Assumption 6.2). The formalization shows that the two regions cannot both be the overlap region. Take <span class="math inline">\(X=\{a/b\}\)</span> and <span class="math inline">\(\mathsf{W}=\{a/c\}\)</span>, which do not overlap. If a write with this <span class="math inline">\(\mathsf{W}\)</span> were allowed to change any path in <span class="math inline">\(\mathrm{reg}(\mathsf{W})\)</span>, it could change the ancestor <span class="math inline">\(a\)</span>. But <span class="math inline">\(a\in\mathrm{reg}(X)\)</span>, so the snapshots before and after would disagree on <span class="math inline">\(X\)</span> although <span class="math inline">\(X\)</span> meets no later write set, and the lemma would be false. The model therefore takes agreement on <span class="math inline">\(\mathrm{reg}(X)\)</span>, which a model that gives content to every node needs, and confines writes to <span class="math inline">\(\mathrm{cov}(\mathsf{W})\)</span>. This is again a direct argument, not a Lean theorem; the Lean frame lemma is the corrected statement.</p>
+<p>Part I’s lemma remains correct as stated, because its agreement excludes ancestors and its directories carry no content. The finding is that this choice carries weight. In Git, a directory has content of its own, the identifier of its tree, and that identifier changes whenever anything below it changes. A model that compared directory identifiers on reads, for instance to record that a writer listed a directory, could not keep the frame lemma with writes confined to the subtrees of the write set. Such a read must be declared as the directory prefix itself, whose subtree contains every write below it, as Part I’s access sets already do.</p>
+<h3 data-number="8.3" id="merged-landings-and-patch-compatibility"><span class="header-section-number">8.3</span> Merged landings and patch compatibility</h3>
+<p>Part I’s Proposition 7.4 excludes members validated as Merge, and its Proposition 6.5 describes the merged state without a serializability claim. The formalization extends the batch result to Merge members and shows what the extension costs. Two hypotheses suggest themselves: that the merged member is a blind write, so no read can be stale, and that its merged paths lie outside its read set. Proposition <a href="#prop:mcbl:mergece">4.5</a> satisfies both and is not serial. The exact condition for one member is patch compatibility (Theorem <a href="#thm:mcbl:mergeiff">4.3</a>), and under it the batch theorem covers Merge members (Theorem <a href="#thm:mcbl:sound">5.1</a>).</p>
+<p>The correction to Part I concerns changesets. Part I’s Definition 8.1 appends a changeset validated as Merge with the effective change produced by the three-way merge, and its Proposition 8.3(3) states that, for FastForward and Rebase, the new branch state is the previous one with <span class="math inline">\(\Phi\)</span> applied. Theorem <a href="#thm:mcbl:mergeiff">4.3</a> and Proposition <a href="#prop:mcbl:pcclean">4.4</a> show that the effective change of a merged changeset equals <span class="math inline">\(\Phi\)</span> on <span class="math inline">\(\mathsf{W}\)</span> exactly when no written path whose content equals its base content was moved by the head. Statements about merged changesets that speak of applying <span class="math inline">\(\Phi\)</span> need that condition.</p>
+<h3 data-number="8.4" id="the-premise-behind-undeclared-reads"><span class="header-section-number">8.4</span> The premise behind undeclared reads</h3>
+<p>The question of what survives under-declared reads was first posed as dropping Part I’s sound-refinement assumption (Part I, Assumption 6.2). That assumption concerns refined write sets: it requires each landing to change only locations that its refined writes cover. A writer that reads more than it declares violates a different premise, that declared reads cover true reads, which Part I uses implicitly in the qualifier “relative to declared reads” of its Theorem 6.4. Section <a href="#sec:mcbl:underdeclared">6</a> drops that premise and keeps Assumption 6.2. Without it, no landed update is lost, serializability can fail, and serializability holds when the undeclared reads meet no later write, a condition that cannot be weakened in general.</p>
+<h2 data-number="9" id="sec:mcbl:limits"><span class="header-section-number">9</span> Limits of the formalization</h2>
+<p>The positional three-way merge is not modelled. Lines are child locations with stable keys, so an insertion that shifts later lines, a deletion, and the alignment of hunks are outside the model. Theorem <a href="#thm:mcbl:lines">4.2</a> and the merge laws hold for this abstraction. Khanna, Kunal and Pierce show that the corresponding laws fail for positional <code>diff3</code> [<a href="#bib-khanna2007diff3">8</a>], so they cannot be transferred to it without further work.</p>
+<p>Validation works at one granularity. Refined write sets <span class="math inline">\(\mathsf{W}^\rho\)</span>, which Part I’s stale-read test uses, and opaque entries, which Part I’s validation treats as conflicts, are not modelled; Part I’s Corollary 6.8 on symbol granularity is not formalized. The log has one ref, so entries on other refs, and Part I’s restriction of <span class="math inline">\(\mathrm{Later}\)</span> to entries on the same ref, do not appear.</p>
+<p>Agreement differs from Part I’s, as Section <a href="#sec:mcbl:model">2</a> describes. The Lean relation compares every path in the overlap region, including ancestors and directory nodes, where Part I compares only file and symbol locations in the subtrees. Content is assigned to each node independently, so a file whose content is determined by its symbols or lines is not represented: a write declared at symbol granularity changes the symbol node and not the file node. The mappings of Part I’s Lemma 6.3 and Theorem 6.4 to Lean theorems are therefore adapted, not literal, and the correspondence with Part I’s relation when ancestors carry no content is an informal observation.</p>
+<p>The log is simpler than Part I’s in ways that remove failure cases rather than add guarantees. A conflicting landing falls back to the change’s value instead of being refused, so the log is total. Each change is computed on the snapshot at its base, so the consistent-base assumption cannot fail. And the log starts at version 0 rather than at an arbitrary version.</p>
+<p>The ref and projection results take as hypotheses what Part I proves of the code or assumes of the hash. Part I’s append discipline (Part I, Lemma 5.3) is a hypothesis of the ref results, and so is the ordering of commit generations. In the Git projection, a commit is identified with the data it encodes, which models content addressing with no collision.</p>
+<p>Several of Part I’s results are not formalized: the rewrite cost (Proposition 4.3), replay determinism and checkpoints (Theorem 5.1), tamper evidence (Proposition 5.2), properties 1 to 3 and 5 of combiner safety (Theorem 7.2), the symbol-granularity corollary (Corollary 6.8), repairs (Definition 7.5), and the correspondence with Kung and Robinson [<a href="#bib-kung1981occ">9</a>] as a theorem. The generic serializability theorem of Bernstein, Hadzilacos and Goodman [<a href="#bib-bhg1987">5</a>] is not formalized either; the model proves the direction Part I uses and proves serializability as a state equality.</p>
+<p>The code is not verified. The theorems are about the model. The implementation is connected to the model by the code-evidence appendices of Parts I and III, which rest on reading code at named commits. Part I reports that the implementation’s three-way merge agrees with <code>git merge-file</code> on a differential test, which is evidence about the merge and not a proof. The check that enforces the pairwise rule in the implementation is described in Part I (Part I, Section 7.3). Whether the implementation’s merged landings satisfy patch compatibility is not established by this paper or by any earlier Part.</p>
+<h2 data-number="10" id="sec:mcbl:tcb"><span class="header-section-number">10</span> Trusted computing base</h2>
+<p>The development is checked by Lean 4 at version 4.35.0, fixed in the project’s toolchain file, and uses core Lean only: no Mathlib and no package dependencies. It contains 180 theorem declarations, helpers included. No proof uses <code>sorry</code> or <code>admit</code>, no <code>axiom</code> is declared, and no definition is <code>unsafe</code> or <code>partial</code>.</p>
+<p>A reader must trust three things: the Lean kernel, the axioms the proofs use, and the claim that the definitions of Section <a href="#sec:mcbl:model">2</a> mean what the prose says. The kernel rechecks every proof term, including those produced by tactics and by evaluation of decidable propositions, so tactics are outside the trusted base. The third item cannot be checked by Lean, which is why this paper shows the core definitions as listings. A few helpers appear in the listings without one: <code>Outcome.clean</code> holds for FastForward and Rebase, <code>Coarsens</code> and <code>CoarsensAll</code> say that every access has an ancestor in the coarser set, <code>WritesDisjoint</code> says that members’ write sets are pairwise disjoint, and <code>Txn.write1</code>, <code>Txn.assign</code> and <code>Txn.patch</code> build transactions that set one location, or a set of locations below the declared write set, from a function of the declared reads.</p>
+<p>The development was reviewed adversarially in two rounds. The first round asked whether each main theorem’s hypotheses could hold, whether the definitions model Part I faithfully, and whether the counterexamples exhibit what they claim. It found three major problems. Validation had been described as exactly Part I’s Definition 4.15, although it uses one granularity and has no opaque entries. With a file as a single location, an accepted Merge member could only be degenerate, so the headline did not reach Part I’s line-level merge case. And the sufficient condition for under-declared reads had been described as an exact boundary. It also found that no concrete accepted batch had been constructed. All of these were fixed: the adapted status of validation is stated (Section <a href="#sec:mcbl:model">2</a>), lines became child locations with stable keys (Theorem <a href="#thm:mcbl:lines">4.2</a>), the tightness result replaced the claim of exactness (Theorem <a href="#thm:mcbl:udtight">6.5</a>), and the witnesses of Section <a href="#sec:mcbl:witnesses">7</a> were added. The second round confirmed the fixes and raised two minor points, a miscounted number of theorems and a stale source comment about line merging, which were also fixed.</p>
+<p>The file <code>AxiomsReport.lean</code> prints the axioms of 72 main theorems. Every one depends on a subset of <code>propext</code> and <code>Quot.sound</code>: 6 on <code>propext</code> alone and 66 on both. None depends on <code>Classical.choice</code> or on <code>sorryAx</code>. <code>Quot.sound</code> enters through function extensionality, which every equality of states uses, and through lemmas of the core simplifier. Table <a href="#tab:mcbl:axioms">1</a> lists the report.</p>
+<table id="tab:mcbl:axioms">
+<caption>Axioms of the main theorems, as printed by <code>AxiomsReport.lean</code>, grouped by file.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">Count</th>
+<th style="text-align: left;">Theorems</th>
+<th style="text-align: left;">Axioms</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Paths</td>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;"><code>overlap_iff_common_descendant</code>, <code>overlap_refl</code>, <code>overlap_coarsen</code>, <code>meetsSet_coarsen</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Paths</td>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;"><code>overlap_symm</code></td>
+<td style="text-align: left;"><code>propext</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Merge</td>
+<td style="text-align: left;">10</td>
+<td style="text-align: left;"><code>merge3_unique</code>, <code>merge3_spec_iff</code>, <code>merge3_comm</code>, <code>merge3State_comm</code>, <code>merge3_base_left</code>, <code>merge3_base_right</code>, <code>merge3_idem</code>, <code>merge_conflict_characterization</code>, <code>merge_no_conflict_of_disjoint</code>, <code>merge3State_eq_applyDiff</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Merge</td>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;"><code>merge3_spec</code>, <code>line_merge_refines</code></td>
+<td style="text-align: left;"><code>propext</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Log</td>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;"><code>frame_point</code>, <code>frame_lemma</code>, <code>snap_append</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Validation</td>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;"><code>independence_iff_rebase</code>, <code>coarsening_sound</code>, <code>coarsening_preserves_frame</code>, <code>independent_of_coarsened</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Serializability</td>
+<td style="text-align: left;">9</td>
+<td style="text-align: left;"><code>reads_current</code>, <code>fastForward_landing</code>, <code>rebase_landing</code>, <code>serializability</code>, <code>changeset_landing</code>, <code>merged_writes</code>, <code>independence</code>, <code>serializability_of_laterDisjoint</code>, <code>no_conflict_path_of_clean</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Batch</td>
+<td style="text-align: left;">12</td>
+<td style="text-align: left;"><code>combiner_member_reads</code>, <code>batch_write_skew</code>, <code>batch_serializable</code>, <code>batch_sequential_validates</code>, <code>batch_serializable_log</code>, <code>landBatch_eq_seqLand</code>, <code>seqLand_eq_serialMerge</code>, <code>batch_merge_sound</code>, <code>merge_serial_iff</code>, <code>patchCompatible_of_agree</code>, <code>serialMerge_eq_serialTxns</code>, <code>patch_patchCompatible_iff</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Batch</td>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;"><code>changeset_patchCompatible_iff</code></td>
+<td style="text-align: left;"><code>propext</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">8</td>
+<td style="text-align: left;"><code>sgraph_edge_forward</code>, <code>sgraph_acyclic</code>, <code>refs_advance</code>, <code>refs_unchanged_no_entry</code>, <code>no_lost_update</code>, <code>projection_deterministic</code>, <code>projection_stable</code>, <code>projection_chain</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;"><code>projection_first_parent</code>, <code>projection_tree</code></td>
+<td style="text-align: left;"><code>propext</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Soundness</td>
+<td style="text-align: left;">6</td>
+<td style="text-align: left;"><code>noConflict_append_batch</code>, <code>batch_landing_merged</code>, <code>batch_landing_serial</code>, <code>batch_rule_needed</code>, <code>batch_landing_sound</code>, <code>merge_not_serial</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">UnderDeclared</td>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;"><code>change_seen</code>, <code>under_declared_no_lost_update</code>, <code>under_declared_safe</code>, <code>under_declared_counterexample</code>, <code>under_declared_tight</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+<tr>
+<td style="text-align: left;">Witnesses</td>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;"><code>Witnesses.line_merge_witness</code>, <code>Witnesses.batch_witness</code>, <code>Witnesses.serializability_witness</code>, <code>Witnesses.frame_witness</code>, <code>Witnesses.under_declared_safe_witness</code></td>
+<td style="text-align: left;"><code>propext</code>, <code>Quot.sound</code></td>
+</tr>
+</tbody>
+</table>
+<p>The build is two commands, run in the directory <code>lean/</code>.</p>
+<p>LSTBLOCK45X</p>
+<p>A clean build takes about 3 s of wall-clock time on the author’s machine and reports no warnings.</p>
+<h2 data-number="11" id="sec:mcbl:relation"><span class="header-section-number">11</span> Relation to Parts I to III and the synthesis</h2>
+<p>Table <a href="#tab:mcbl:map">2</a> maps each result of the series that the development touches to its Lean theorems. The status <em>proved</em> means the Lean statement is the paper’s statement in the model’s terms. <em>Adapted</em> means it is proved for a changed definition, such as one granularity or the stronger agreement relation. <em>Proved with extra hypothesis</em> means a hypothesis the paper does not state, or states as a property of the code, appears in the Lean statement. <em>Not formalized</em> means no Lean statement exists.</p>
+<table id="tab:mcbl:map">
+<caption>Results of the series and the Lean theorems that formalize them.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Paper result</th>
+<th style="text-align: left;">Lean theorems</th>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">Status</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">Part I, Definition 4.4</td>
+<td style="text-align: left;"><code>anc</code>, <code>meets</code>, <code>meetsSet</code>, <code>covered</code></td>
+<td style="text-align: left;">Paths</td>
+<td style="text-align: left;">Adapted (symbols as path components)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Lemma 4.5</td>
+<td style="text-align: left;"><code>overlap_iff_common_descendant</code>, <code>overlap_refl</code>, <code>overlap_symm</code>, <code>overlap_coarsen</code></td>
+<td style="text-align: left;">Paths</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Definition 4.7 (Eq. 1)</td>
+<td style="text-align: left;"><code>Independent</code></td>
+<td style="text-align: left;">Validation</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Definitions 4.8 to 4.11</td>
+<td style="text-align: left;"><code>Entry</code>, <code>Log</code>, <code>snap</code></td>
+<td style="text-align: left;">Log</td>
+<td style="text-align: left;">Adapted (tree states of one ref)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Definition 4.15</td>
+<td style="text-align: left;"><code>validate</code>, <code>validateAt</code></td>
+<td style="text-align: left;">Validation</td>
+<td style="text-align: left;">Adapted (one granularity, no opaque entries)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 5.4</td>
+<td style="text-align: left;"><code>refs_advance</code>, <code>refs_unchanged_no_entry</code></td>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">Proved with extra hypothesis (append discipline, generations)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Corollary 5.5</td>
+<td style="text-align: left;"><code>no_lost_update</code></td>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">Proved with extra hypothesis (append discipline)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 5.6</td>
+<td style="text-align: left;"><code>snap_append</code>, <code>snap_of_take_eq</code></td>
+<td style="text-align: left;">Log</td>
+<td style="text-align: left;">Adapted (tree states)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Assumption 6.2</td>
+<td style="text-align: left;"><code>Txn.frame</code>, <code>ChangesWithin</code>, <code>snap_step_changesWithin</code></td>
+<td style="text-align: left;">State, Log</td>
+<td style="text-align: left;">Adapted (one step, path granularity)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Lemma 6.3</td>
+<td style="text-align: left;"><code>frame_lemma</code>, <code>frame_point</code>, <code>frame_of_laterWrites</code></td>
+<td style="text-align: left;">Log</td>
+<td style="text-align: left;">Adapted (agreement)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 6.4, parts 1 to 3</td>
+<td style="text-align: left;"><code>reads_current</code>, <code>fastForward_landing</code>, <code>rebase_landing</code></td>
+<td style="text-align: left;">Serializability</td>
+<td style="text-align: left;">Adapted (agreement; no commits)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 6.4, serializability</td>
+<td style="text-align: left;"><code>serializability</code></td>
+<td style="text-align: left;">Serializability</td>
+<td style="text-align: left;">Adapted (agreement; state equality)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 6.5</td>
+<td style="text-align: left;"><code>merge3_spec</code>, <code>merge3_unique</code>, <code>merged_writes</code>, <code>line_merge_refines</code></td>
+<td style="text-align: left;">Merge, Serializability</td>
+<td style="text-align: left;">Adapted (per location; lines with stable keys)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 6.7</td>
+<td style="text-align: left;"><code>independence_iff_rebase</code>, <code>independence</code></td>
+<td style="text-align: left;">Validation, Serializability</td>
+<td style="text-align: left;">Proved (state equality in the forward direction)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Corollary 6.8</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">Not formalized</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 6.10</td>
+<td style="text-align: left;"><code>coarsening_sound</code>, <code>coarsening_preserves_frame</code>, <code>independent_of_coarsened</code></td>
+<td style="text-align: left;">Validation</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 7.2, property 4</td>
+<td style="text-align: left;"><code>combiner_member_reads</code></td>
+<td style="text-align: left;">Batch</td>
+<td style="text-align: left;">Adapted (agreement)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 7.2, properties 1 to 3 and 5</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">Not formalized</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 7.3</td>
+<td style="text-align: left;"><code>batch_write_skew</code>, <code>batch_rule_needed</code></td>
+<td style="text-align: left;">Batch, Soundness</td>
+<td style="text-align: left;">Adapted (history built in the model)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 7.4</td>
+<td style="text-align: left;"><code>batch_serializable</code>, <code>batch_serializable_log</code>, <code>batch_sequential_validates</code>, <code>batch_landing_serial</code></td>
+<td style="text-align: left;">Batch, Soundness</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 7.4 with Merge members</td>
+<td style="text-align: left;"><code>batch_landing_sound</code>, <code>batch_landing_merged</code></td>
+<td style="text-align: left;">Soundness</td>
+<td style="text-align: left;">Proved with extra hypothesis (patch compatibility)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 8.3(3)</td>
+<td style="text-align: left;"><code>changeset_landing</code></td>
+<td style="text-align: left;">Serializability</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Proposition 8.3(5)</td>
+<td style="text-align: left;"><code>projection_chain</code></td>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">Proved</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Assumption 8.2 and Part II, Lemma 13.2</td>
+<td style="text-align: left;"><code>projection_deterministic</code>, <code>projection_stable</code>, <code>projection_first_parent</code>, <code>projection_tree</code></td>
+<td style="text-align: left;">Graph</td>
+<td style="text-align: left;">Proved (hashing abstracted)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part I, Theorem 5.1, Propositions 4.3 and 5.2, Definition 7.5</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">Not formalized</td>
+</tr>
+<tr>
+<td style="text-align: left;">Part III, capacity model and realization</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">None</td>
+<td style="text-align: left;">Not formalized</td>
+</tr>
+<tr>
+<td style="text-align: left;">Synthesis, Theorem 4.4</td>
+<td style="text-align: left;"><code>batch_write_skew</code>, <code>batch_landing_serial</code></td>
+<td style="text-align: left;">Batch, Soundness</td>
+<td style="text-align: left;">Adapted (as Part I, Theorem 7.3 and Proposition 7.4)</td>
+</tr>
+<tr>
+<td style="text-align: left;">Synthesis, Proposition 5.3, isolation part</td>
+<td style="text-align: left;"><code>serializability</code>, <code>batch_landing_sound</code></td>
+<td style="text-align: left;">Serializability, Soundness</td>
+<td style="text-align: left;">Proved for the model (throughput bound not formalized)</td>
+</tr>
+</tbody>
+</table>
+<p>The results without a counterpart in Parts I to III are the exact condition for merged landings and its counterexample, the changeset criterion, line-level refinement, the merge laws other than the specification, the under-declared results and the witnesses.</p>
+<p>Part I’s results about refs, its Theorem 5.4 and Corollary 5.5, are formalized over an abstract ref log. A ref log entry names a ref and the commit it installs, and parents are a function from commits to lists of commits. Under the append discipline, which Part I proves of the code as its Lemma 5.3 and which the model takes as a hypothesis, a ref’s later values reach its earlier value by first parents. If, in addition, every parent has a smaller generation, a ref with equal values at two versions is named by no entry between them. And a commit landed on a ref stays an ancestor of the ref’s value.</p>
+<p>LSTBLOCK46X</p>
+<p>The Git projection of Part II is formalized as a function of the log prefix. Part II defines the projected commit of main at version <span class="math inline">\(j\)</span> from the commit at version <span class="math inline">\(j-1\)</span> and the <span class="math inline">\(j\)</span>-th changeset entry (Part II, Definition 13.1) and proves that it depends only on the prefix (Part II, Lemma 13.2). The Lean statement is that two logs with equal prefixes of length <span class="math inline">\(j\)</span> give the same projected commit. The projected commit at <span class="math inline">\(j\)</span> has the commit at <span class="math inline">\(j-1\)</span> as first parent when entry <span class="math inline">\(j\)</span> exists, which discharges Part I’s Assumption 8.2, and the commit at <span class="math inline">\(u\)</span> lies on the first-parent chain of the commit at every later <span class="math inline">\(v\)</span>, which is Part I’s Proposition 8.3(5).</p>
+<p>LSTBLOCK47X</p>
+<p>For the synthesis, the theorem that matters is Proposition 5.3, which treats batch size as a capacity parameter under either of two hypotheses [<a href="#bib-long2026synthesis">13</a>]. Under the first, members are appended one at a time, each validated against a log that contains the earlier members; that is a clean log, and Theorem <a href="#thm:mcbl:serial">3.3</a> applies. Under the second, the command defers any member whose reads or writes meet an earlier member’s writes; that is the pairwise rule, and Theorem <a href="#thm:mcbl:sound">5.1</a> applies to the accepted members, including members validated as Merge when they are patch-compatible. The throughput part of the proposition, which rests on Part III’s capacity model, is not formalized.</p>
+<h2 data-number="12" id="sec:mcbl:related"><span class="header-section-number">12</span> Related work</h2>
+<p>The serializability arguments are classical. Kung and Robinson’s serial validation is the landing step [<a href="#bib-kung1981occ">9</a>]. The serialization graph and the theorem that an acyclic graph gives serializability come from Bernstein, Hadzilacos and Goodman [<a href="#bib-bhg1987">5</a>]. The batch anomaly is phenomenon G2-item in Adya’s classification [<a href="#bib-adya1999thesis">1</a>], with the shape of write skew in the terms of Berenson and colleagues [<a href="#bib-berenson1995critique">4</a>], and Fekete and colleagues characterize when histories under snapshot isolation fail to be serializable [<a href="#bib-fekete2005serializable">7</a>]. The present development instantiates these arguments for one model and checks them mechanically, with the state equality of serial execution as the conclusion rather than graph acyclicity alone.</p>
+<p>The write-write case is where source control differs from a database, and the three-way merge is its mechanism. Khanna, Kunal and Pierce give a formal investigation of <code>diff3</code> and show that several properties one would expect of it fail in general [<a href="#bib-khanna2007diff3">8</a>]. The model here sidesteps their difficulties by merging per location and treating lines as locations with stable keys. It is therefore a statement about an idealized merge, and its laws should be read alongside their negative results. The transaction log itself follows the lakehouse formats, of which Delta Lake is the model for this series [<a href="#bib-armbrust2020delta">3</a>]. Lean 4 is described by de Moura and Ullrich [<a href="#bib-demoura2021lean4">6</a>].</p>
+<h2 data-number="13" id="sec:mcbl:conclusion"><span class="header-section-number">13</span> Conclusion</h2>
+<p>The core of the transactional model of source control is machine-checked. In the model, a batch whose members are fast-forwards, rebases or conflict-free merges lands as the serial execution of its members in ticket order, provided no member reads or writes what an earlier member wrote and every merged member is patch-compatible with the head. Each hypothesis is necessary: write skew defeats the first, and a blind write that never read its merged path defeats the second. Patch compatibility is the exact condition for a merged landing to be a serial step, and for changesets it says that a change never writes a stale base value back over a path the head moved. Writing the model in Lean also corrected the merge rule, located the frame lemma’s dependence on its two regions, and identified the premise that undeclared reads violate.</p>
+<p>Three gaps remain between these theorems and the system. The merge is an idealization with stable line keys, not positional <code>diff3</code>. The implementation is linked to the model by reading code, not by proof. And whether the implementation’s merged landings are patch-compatible is unknown; checking the condition at landing, or restricting changesets to paths whose content they change, would close that gap for changesets. Within the model, the foundation that the series’ thesis needs is now proved by machine: transactions with declared read and write sets, landed in batches by one serialized authority, are serializable under conditions that can be checked at landing.</p>
+<h2 class="unnumbered" id="references">References</h2>
+<div class="refitem">
+<p><span id="bib-adya1999thesis" data-label="bib-adya1999thesis"></span><strong>[1]</strong> A. Adya. Weak consistency: A generalized theory and optimistic implementations for distributed transactions. PhD thesis, Massachusetts Institute of Technology, March 1999. MIT-LCS-TR-786. <a href="https://dspace.mit.edu/handle/1721.1/149899" class="uri">https://dspace.mit.edu/handle/1721.1/149899</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-anthropic2026scion" data-label="bib-anthropic2026scion"></span><strong>[2]</strong> Nick G. and the source control team. Redesigning source control at Anthropic. Anthropic Engineering, 13 October 2026, updated 15 October 2026. <a href="https://www.anthropic.com/engineering/redesigning-source-control" class="uri">https://www.anthropic.com/engineering/redesigning-source-control</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-armbrust2020delta" data-label="bib-armbrust2020delta"></span><strong>[3]</strong> M. Armbrust, T. Das, L. Sun, B. Yavuz, S. Zhu, M. Murthy, J. Torres, H. van Hovell, A. Ionescu, A. <span>Ł</span>uszczak, M. <span>Ś</span>witakowski, M. Szafra<span>ń</span>ski, X. Li, T. Ueshin, M. Mokhtar, P. Boncz, A. Ghodsi, S. Paranjpye, P. Senster, R. Xin, and M. Zaharia. Delta Lake: High-performance ACID table storage over cloud object stores. <em>Proceedings of the VLDB Endowment</em>, 13(12):3411-3424, 2020. doi:10.14778/3415478.3415560.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-berenson1995critique" data-label="bib-berenson1995critique"></span><strong>[4]</strong> H. Berenson, P. Bernstein, J. Gray, J. Melton, E. O’Neil, and P. O’Neil. A critique of ANSI SQL isolation levels. In <em>Proceedings of the 1995 ACM SIGMOD International Conference on Management of Data</em>, pages 1-10, 1995. doi:10.1145/223784.223785.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-bhg1987" data-label="bib-bhg1987"></span><strong>[5]</strong> P. A. Bernstein, V. Hadzilacos, and N. Goodman. <em>Concurrency Control and Recovery in Database Systems</em>. Addison-Wesley, 1987. <a href="https://www.microsoft.com/en-us/research/people/philbe/book/" class="uri">https://www.microsoft.com/en-us/research/people/philbe/book/</a>.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-demoura2021lean4" data-label="bib-demoura2021lean4"></span><strong>[6]</strong> L. de Moura and S. Ullrich. The Lean 4 theorem prover and programming language. In <em>Automated Deduction, CADE 28</em>, Lecture Notes in Computer Science, pages 625-635. Springer, 2021. doi:10.1007/978-3-030-79876-5_37.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-fekete2005serializable" data-label="bib-fekete2005serializable"></span><strong>[7]</strong> A. Fekete, D. Liarokapis, E. O’Neil, P. O’Neil, and D. Shasha. Making snapshot isolation serializable. <em>ACM Transactions on Database Systems</em>, 30(2):492-528, 2005. doi:10.1145/1071610.1071615.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-khanna2007diff3" data-label="bib-khanna2007diff3"></span><strong>[8]</strong> S. Khanna, K. Kunal, and B. C. Pierce. A formal investigation of diff3. In <em>FSTTCS 2007: Foundations of Software Technology and Theoretical Computer Science</em>, Lecture Notes in Computer Science, pages 485-496. Springer, 2007. doi:10.1007/978-3-540-77050-3_40.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-kung1981occ" data-label="bib-kung1981occ"></span><strong>[9]</strong> H. T. Kung and J. T. Robinson. On optimistic methods for concurrency control. <em>ACM Transactions on Database Systems</em>, 6(2):213-226, 1981. doi:10.1145/319566.319567.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026partI" data-label="bib-long2026partI"></span><strong>[10]</strong> M. Long and The YonedaAI Collaboration. A transaction log for source control. Part I of <em>Source Code as a Transactional Abstraction</em>, YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026partII" data-label="bib-long2026partII"></span><strong>[11]</strong> M. Long and The YonedaAI Collaboration. Partitioned derived data. Part II of <em>Source Code as a Transactional Abstraction</em>, YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026partIII" data-label="bib-long2026partIII"></span><strong>[12]</strong> M. Long and The YonedaAI Collaboration. A cloud-portable architecture for serverless Git. Part III of <em>Source Code as a Transactional Abstraction</em>, YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-long2026synthesis" data-label="bib-long2026synthesis"></span><strong>[13]</strong> M. Long and The YonedaAI Collaboration. Source code as a transactional abstraction: Foundations for transactional source control, with a serverless realization. YonedaAI Research Collective, author’s manuscript, October 2026.</p>
+</div>
+<div class="refitem">
+<p><span id="bib-yonedatx" data-label="bib-yonedatx"></span><strong>[14]</strong> M. Long. YonedaTx: Lean 4 formalization of the transactional model of source control. Directory <code>lean/</code> of the repository YonedaAI/yonedarepo-research, October 2026. <a href="https://github.com/YonedaAI/yonedarepo-research/tree/main/lean" class="uri">https://github.com/YonedaAI/yonedarepo-research/tree/main/lean</a>.</p>
+</div>
+<h2 class="unnumbered" id="appendixmarker">APPENDIXMARKER</h2>
+<h2 data-number="14" id="app:mcbl:evidence"><span class="header-section-number">14</span> Code evidence</h2>
+<p>Table <a href="#tab:mcbl:evidence">3</a> maps each Lean listing in this paper to the file and line of the declarations it quotes. Paths are relative to the root of the public repository [<a href="#bib-yonedatx">14</a>]. Where a listing quotes several declarations, the line column gives the first line of each, in the order the listing shows them. Every row can be checked by opening the named file at the named lines.</p>
+<table id="tab:mcbl:evidence">
+<caption>Lean listings and the declarations they quote.</caption>
+<thead>
+<tr>
+<th style="text-align: left;">Row</th>
+<th style="text-align: left;">Claim</th>
+<th style="text-align: left;">File</th>
+<th style="text-align: left;">Lines</th>
+<th style="text-align: left;">What the code shows</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align: left;">1</td>
+<td style="text-align: left;">Paths, ancestry and overlap</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Paths.lean</code></td>
+<td style="text-align: left;">17, 20, 75, 111, 114, 117, 121</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:paths">1</a>: A path is a list of components. <code>anc</code> is component-wise prefix. <code>meets</code> is comparability under <code>anc</code>. <code>covered</code> and <code>region</code> decide membership in the subtrees of a set and in its overlap region.</td>
+</tr>
+<tr>
+<td style="text-align: left;">2</td>
+<td style="text-align: left;">Part I, Lemma 4.5</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Paths.lean</code></td>
+<td style="text-align: left;">81, 92, 95, 99</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:overlap">2</a>: Overlap holds iff the two subtrees share a node. It is reflexive and symmetric, and it survives replacing an access by an ancestor.</td>
+</tr>
+<tr>
+<td style="text-align: left;">3</td>
+<td style="text-align: left;">States, agreement and confinement of changes</td>
+<td style="text-align: left;"><code>lean/YonedaTx/State.lean</code></td>
+<td style="text-align: left;">15, 18, 23, 41</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:state">3</a>: A state maps every path to optional content. <code>Agree</code> compares the overlap region of a set. <code>ChangesWithin</code> confines differences to covered paths.</td>
+</tr>
+<tr>
+<td style="text-align: left;">4</td>
+<td style="text-align: left;">A transaction carries R, W and a frame condition</td>
+<td style="text-align: left;"><code>lean/YonedaTx/State.lean</code></td>
+<td style="text-align: left;">65</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:txn">4</a>: The structure has fields <code>R</code>, <code>W</code> and <code>f</code>, a <code>frame</code> proof that <code>f</code> changes only covered paths, and a <code>reads</code> proof that written values depend only on <code>R ++ W</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;">5</td>
+<td style="text-align: left;">Changesets are blind writes</td>
+<td style="text-align: left;"><code>lean/YonedaTx/State.lean</code></td>
+<td style="text-align: left;">76, 80</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:changeset">5</a>: <code>Txn.changeset</code> overlays <span class="math inline">\(\Phi\)</span> on the paths covered by <span class="math inline">\(W\)</span>, whatever the state it runs on.</td>
+</tr>
+<tr>
+<td style="text-align: left;">6</td>
+<td style="text-align: left;">The log and its snapshots</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Log.lean</code></td>
+<td style="text-align: left;">19, 24, 29</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:log">6</a>: An entry is a transaction and a base. <code>snap</code> folds the entries, landing each change computed on its (capped) base onto the previous snapshot with <code>landOn</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;">7</td>
+<td style="text-align: left;">Later write sets</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Log.lean</code></td>
+<td style="text-align: left;">102</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:later">7</a>: <code>laterWrites log b n</code> lists the write sets of the entries at list positions b to n-1, that is, versions b+1 to n.</td>
+</tr>
+<tr>
+<td style="text-align: left;">8</td>
+<td style="text-align: left;">Part I, Definition 4.15, at one granularity</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Validation.lean</code></td>
+<td style="text-align: left;">13, 24, 31</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:validate">8</a>: Four outcomes. Conflict when R meets a later write, FastForward when there is none, Merge when W meets one, Rebase otherwise. One list of write sets serves both tests.</td>
+</tr>
+<tr>
+<td style="text-align: left;">9</td>
+<td style="text-align: left;">Logs with no Conflict landing, and clean logs</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Validation.lean</code></td>
+<td style="text-align: left;">123, 129</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:validated">9</a>: <code>NoConflict</code> requires each entry’s base to precede it and its validation not to be Conflict. <code>Validated</code> requires FastForward or Rebase.</td>
+</tr>
+<tr>
+<td style="text-align: left;">10</td>
+<td style="text-align: left;">Three-way merge with the same-change clause</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Merge.lean</code></td>
+<td style="text-align: left;">32, 62, 65, 69, 221</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:merge">10</a>: <code>merge3Cell</code> returns theirs if ours is the base, ours if theirs is the base, ours if both agree, and a conflict otherwise. <code>landOn</code> installs the merge with the head as ours.</td>
+</tr>
+<tr>
+<td style="text-align: left;">11</td>
+<td style="text-align: left;">A conflict-free merge applies a diff</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Merge.lean</code></td>
+<td style="text-align: left;">173, 177</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:diff">11</a>: <code>applyDiff b c h</code> takes c where c differs from b and h elsewhere. A conflict-free merge equals the diff of theirs applied to ours.</td>
+</tr>
+<tr>
+<td style="text-align: left;">12</td>
+<td style="text-align: left;">Lines with stable keys</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Merge.lean</code></td>
+<td style="text-align: left;">193, 196</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:lines">12</a>: Line <span class="math inline">\(\ell\)</span> of file <span class="math inline">\(f\)</span> is the child location of <span class="math inline">\(f\)</span> named <span class="math inline">\(\ell\)</span>. A file-granular conflict compares whole line maps.</td>
+</tr>
+<tr>
+<td style="text-align: left;">13</td>
+<td style="text-align: left;">The batch entry is an octopus merge</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">17, 24, 29, 32</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:batchdefs">13</a>: A member is a transaction and its base state. Each member’s change is merged against the head, and <code>octopus</code> takes at each path the first merged change that differs from the head.</td>
+</tr>
+<tr>
+<td style="text-align: left;">14</td>
+<td style="text-align: left;">Serial forms and the pairwise rule</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">35, 39, 43, 47, 51</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:serialdefs">14</a>: <code>seqLand</code> lands members one at a time. <code>serialTxns</code> runs the transactions in order. <code>serialMerge</code> merges each change into the state so far. <code>BatchRule</code> is the rule of Part I, Proposition 7.4.</td>
+</tr>
+<tr>
+<td style="text-align: left;">15</td>
+<td style="text-align: left;">Patch compatibility</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">152</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:pc">15</a>: On its write set, running the member on H equals its own diff against its base applied to H.</td>
+</tr>
+<tr>
+<td style="text-align: left;">16</td>
+<td style="text-align: left;">Acceptance of a batch</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">36, 46</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:accepted">16</a>: A member is accepted when its base is at most the head and it validates as FastForward, Rebase, or a Merge with no conflict path. A batch also satisfies the rule pairwise in ticket order.</td>
+</tr>
+<tr>
+<td style="text-align: left;">17</td>
+<td style="text-align: left;">Serialization graph over declared accesses</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Graph.lean</code></td>
+<td style="text-align: left;">23, 30</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:sedge">17</a>: Edges are write-write, write-read and read-write overlaps between entries placed at their base and landing versions. <code>SReach</code> is its transitive closure.</td>
+</tr>
+<tr>
+<td style="text-align: left;">18</td>
+<td style="text-align: left;">Part I, Lemma 6.3</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Log.lean</code></td>
+<td style="text-align: left;">154</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:frame">18</a>: If X meets no write set of the entries in (b, v], the snapshots at b and v agree on X.</td>
+</tr>
+<tr>
+<td style="text-align: left;">19</td>
+<td style="text-align: left;">Part I, Theorem 6.4, parts 1 to 3</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Serializability.lean</code></td>
+<td style="text-align: left;">18, 52, 78</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:thm64">19</a>: A landing that is not a Conflict read current values of R. A FastForward has base equal to the head and installs the change. A Rebase installs the change on W and the head elsewhere.</td>
+</tr>
+<tr>
+<td style="text-align: left;">20</td>
+<td style="text-align: left;">Part I, Theorem 6.4, serializability statement</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Serializability.lean</code></td>
+<td style="text-align: left;">43, 149</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:serial">20</a>: For a <code>Validated</code> log every snapshot equals serial execution in log order, and each entry’s declared reads at its base equal its reads in that order.</td>
+</tr>
+<tr>
+<td style="text-align: left;">21</td>
+<td style="text-align: left;">Part I, Proposition 6.5, at file level</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Serializability.lean</code></td>
+<td style="text-align: left;">170</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:merged">21</a>: Outside W the landed state is the head. On W minus later writes it is the change. At every path without a conflict the merge is the landed value.</td>
+</tr>
+<tr>
+<td style="text-align: left;">22</td>
+<td style="text-align: left;">Part I, Theorem 6.7, validation part</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Validation.lean</code></td>
+<td style="text-align: left;">203, 222</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:indepval">22</a>: Eq. 1 holds iff, in both landing orders, the second change is validated as Rebase against the first.</td>
+</tr>
+<tr>
+<td style="text-align: left;">23</td>
+<td style="text-align: left;">Part I, Theorem 6.7, state part</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Serializability.lean</code></td>
+<td style="text-align: left;">199</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:indepstate">23</a>: For independent changes on one base, both landing orders validate as Rebase and give the same state, which equals both serial orders.</td>
+</tr>
+<tr>
+<td style="text-align: left;">24</td>
+<td style="text-align: left;">Part I, Proposition 6.10, validation part</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Validation.lean</code></td>
+<td style="text-align: left;">169</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:coarsen">24</a>: Coarsening R, W and the later write sets keeps every Conflict a Conflict and every Merge a Merge or a Conflict.</td>
+</tr>
+<tr>
+<td style="text-align: left;">25</td>
+<td style="text-align: left;">Edges point forward and the graph is acyclic</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Graph.lean</code></td>
+<td style="text-align: left;">37, 59</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:acyclic">25</a>: In a log with no Conflict landing every edge goes from a lower to a higher position, so no node reaches itself.</td>
+</tr>
+<tr>
+<td style="text-align: left;">26</td>
+<td style="text-align: left;">Specification, uniqueness, commutativity, identities, idempotence</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Merge.lean</code></td>
+<td style="text-align: left;">73, 79, 96, 107, 127, 142, 146, 150, 160</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:laws">26</a>: The merge meets its specification without conflicts, is the unique state that does, is commutative including conflicts, has both identities, is idempotent, and has no conflict for disjoint write sets.</td>
+</tr>
+<tr>
+<td style="text-align: left;">27</td>
+<td style="text-align: left;">Edits to disjoint lines of one file merge cleanly by line</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Merge.lean</code></td>
+<td style="text-align: left;">204</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:linerefine">27</a>: If every line is unchanged on one side, no line is a conflict path, and each line’s merge applies the diff of either side to the other.</td>
+</tr>
+<tr>
+<td style="text-align: left;">28</td>
+<td style="text-align: left;">Merged landing is a serial step iff patch-compatible</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">157</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:mergeiff">28</a>: For a conflict-free member, the merge with H equals running the transaction on H if and only if <code>PatchCompatible</code> holds.</td>
+</tr>
+<tr>
+<td style="text-align: left;">29</td>
+<td style="text-align: left;">Patch compatibility of clean members and of changesets</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">170, 183</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:pcagree">29</a>: Agreement of base and head on R and W gives patch compatibility. For a changeset it holds iff no written path left at its base content was moved by the head.</td>
+</tr>
+<tr>
+<td style="text-align: left;">30</td>
+<td style="text-align: left;">A blind write with an unread merged path is not serial</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">258, 262, 264, 280</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:mergece">30</a>: The changeset m declares x and y with no reads, is validated as Merge with no conflict path and accepted, yet the batch differs from running m on the head and m is not patch-compatible.</td>
+</tr>
+<tr>
+<td style="text-align: left;">31</td>
+<td style="text-align: left;">Headline: batch landing soundness</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">181</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:sound">31</a>: For a log with no Conflict and an accepted batch whose Merge members are patch-compatible, the batch equals serial execution in ticket order, equals the final snapshot of the log followed by the members, and the graph has no cycle.</td>
+</tr>
+<tr>
+<td style="text-align: left;">32</td>
+<td style="text-align: left;">Octopus equals sequential equals serial</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">87, 120, 219</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:batchlemmas">32</a>: Disjoint writes make the octopus merge equal sequential landing. No conflict path makes that the serial merge. The rule and patch compatibility make that serial execution.</td>
+</tr>
+<tr>
+<td style="text-align: left;">33</td>
+<td style="text-align: left;">The members appended to the log</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">91, 111</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:noconf">33</a>: After j members the snapshot is the sequential landing of the first j. The log followed by an accepted batch has no Conflict landing.</td>
+</tr>
+<tr>
+<td style="text-align: left;">34</td>
+<td style="text-align: left;">The merge form, and the clean case</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">144, 209</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:soundmerged">34</a>: Without patch compatibility the batch equals <code>serialMerge</code>. With only FastForward and Rebase members it equals <code>serialTxns</code>.</td>
+</tr>
+<tr>
+<td style="text-align: left;">35</td>
+<td style="text-align: left;">The write-skew history of Part I, Theorem 7.3</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">381, 384, 387, 391, 395</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:skewdefs">35</a>: The initial state has x = y = 0. <code>c0</code> writes z. <code>ca</code> reads x and sets y to x + 1. <code>cb</code> reads y and sets x to y + 1.</td>
+</tr>
+<tr>
+<td style="text-align: left;">36</td>
+<td style="text-align: left;">Part I, Theorem 7.3: batch write skew</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Batch.lean</code></td>
+<td style="text-align: left;">412</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:writeskew">36</a>: Both members are validated as Rebase against the log, their write sets are disjoint, each reads what the other writes, the batch equals neither serial order, and landed one at a time the second would be a Conflict.</td>
+</tr>
+<tr>
+<td style="text-align: left;">37</td>
+<td style="text-align: left;">Without the rule: accepted, not serial, cyclic</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Soundness.lean</code></td>
+<td style="text-align: left;">223</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:ruleneeded">37</a>: Both members are accepted, the rule fails, the batch equals neither serial order, and position 1 of the extended log reaches itself in the serialization graph.</td>
+</tr>
+<tr>
+<td style="text-align: left;">38</td>
+<td style="text-align: left;">Declared versus true reads</td>
+<td style="text-align: left;"><code>lean/YonedaTx/UnderDeclared.lean</code></td>
+<td style="text-align: left;">26, 29, 34, 39</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:uddefs">38</a>: Validation uses declared sets <code>D i</code>. The write check requires only that no landing has a conflict path. <code>undeclared</code> is the true read set minus the declared one.</td>
+</tr>
+<tr>
+<td style="text-align: left;">39</td>
+<td style="text-align: left;">No lost update with under-declared reads</td>
+<td style="text-align: left;"><code>lean/YonedaTx/UnderDeclared.lean</code></td>
+<td style="text-align: left;">48, 72</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:udnlu">39</a>: A landing changes p only if it writes p from a base that held the current value. Hence the value at i survives unless such a landing intervenes.</td>
+</tr>
+<tr>
+<td style="text-align: left;">40</td>
+<td style="text-align: left;">Under-declared counterexample</td>
+<td style="text-align: left;"><code>lean/YonedaTx/UnderDeclared.lean</code></td>
+<td style="text-align: left;">128, 131, 146</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:udce">40</a>: With c_a’s read of x undeclared, both landings validate and pass the write check, the final state is neither serial order, and with true reads c_a is a Conflict.</td>
+</tr>
+<tr>
+<td style="text-align: left;">41</td>
+<td style="text-align: left;">Under-declared reads that meet no later write are safe</td>
+<td style="text-align: left;"><code>lean/YonedaTx/UnderDeclared.lean</code></td>
+<td style="text-align: left;">99</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:udsafe">41</a>: If the undeclared reads of each entry meet no later write set, every snapshot is serial and true reads agree with serial reads.</td>
+</tr>
+<tr>
+<td style="text-align: left;">42</td>
+<td style="text-align: left;">The condition cannot be weakened in general</td>
+<td style="text-align: left;"><code>lean/YonedaTx/UnderDeclared.lean</code></td>
+<td style="text-align: left;">180</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:udtight">42</a>: Whenever undeclared reads meet an intervening write set while the declared reads and a non-empty write set do not, some transactions with those sets are accepted and equal neither serial order.</td>
+</tr>
+<tr>
+<td style="text-align: left;">43</td>
+<td style="text-align: left;">Non-vacuity: a Merge with a file conflict, clean by line</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Witnesses.lean</code></td>
+<td style="text-align: left;">31, 45, 48, 51, 55, 58, 76</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:wline">43</a>: <code>m1</code> is validated as Merge, the file-granular merge of F conflicts, no path is a conflict, and the landing keeps both edits.</td>
+</tr>
+<tr>
+<td style="text-align: left;">44</td>
+<td style="text-align: left;">Non-vacuity of the headline</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Witnesses.lean</code></td>
+<td style="text-align: left;">130</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:wbatch">44</a>: A non-empty log, an accepted batch whose first member is validated as Merge and is patch-compatible, and the batch equal to serial execution with both edits and the increment present.</td>
+</tr>
+<tr>
+<td style="text-align: left;">45</td>
+<td style="text-align: left;">Non-vacuity of Theorem 6.4, Lemma 6.3 and the safe condition</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Witnesses.lean</code></td>
+<td style="text-align: left;">156, 170, 178, 192</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:wother">45</a>: A validated two-entry log whose second entry is a Rebase with base 0 and whose final snapshot is serial, snapshots 0 and 1 that differ at F/1 and agree on G, and a log validated with empty declared sets, whose second entry’s undeclared reads are G, equal to serial execution.</td>
+</tr>
+<tr>
+<td style="text-align: left;">46</td>
+<td style="text-align: left;">Part I, Theorem 5.4 and Corollary 5.5</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Graph.lean</code></td>
+<td style="text-align: left;">90, 150, 183, 211</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:refs">47</a>: Under the append discipline a ref’s later values reach its earlier value by first parents. With generations, equal values at u and v mean no entry in between names the ref. And a landed commit stays an ancestor.</td>
+</tr>
+<tr>
+<td style="text-align: left;">47</td>
+<td style="text-align: left;">Part II, Lemma 13.2, and Part I, Proposition 8.3(5)</td>
+<td style="text-align: left;"><code>lean/YonedaTx/Graph.lean</code></td>
+<td style="text-align: left;">272, 294, 313</td>
+<td style="text-align: left;">Listing <a href="#lst:mcbl:projection">48</a>: The projected commit at j depends only on the first j entries, has the previous projection as first parent, and earlier projections lie on its first-parent chain.</td>
+</tr>
+</tbody>
+</table>

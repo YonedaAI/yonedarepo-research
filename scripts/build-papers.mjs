@@ -21,6 +21,7 @@ const PAPERS = [
   { slug: 'transaction-log-source-control', part: 'Part I', short: 'Part I' },
   { slug: 'partitioned-derived-data', part: 'Part II', short: 'Part II' },
   { slug: 'serverless-git-on-cloudflare', part: 'Part III', short: 'Part III' },
+  { slug: 'machine-checked-batch-landing', part: 'Part IV', short: 'Part IV' },
 ];
 
 const DIRS = {
@@ -174,6 +175,21 @@ function preprocess(slug) {
 
   const { labels, cites } = parseAux(slug);
 
+  // lstlisting -> placeholder paragraph; real <figure><pre><code> is substituted after pandoc
+  const listings = [];
+  const escH = (t) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const capHtml = (c) => escH(c).replace(/\\(?:texttt|code|path|nolinkurl)\{([^}]*)\}/g, '<code>$1</code>').replace(/\\([_#%&])/g, '$1');
+  body = body.replace(/\\begin\{lstlisting\}(?:\[([^\n]*)\])?\n([\s\S]*?)\n?\\end\{lstlisting\}/g, (m, opts, code) => {
+    let cap = '', lab = '';
+    const ci = (opts ?? '').indexOf('caption=');
+    if (ci >= 0) cap = readGroup(opts, ci + 'caption='.length)[0];
+    const lm = /label=\{([^}]+)\}/.exec(opts ?? '');
+    if (lm) lab = lm[1];
+    const lang = /language=([A-Za-z]+)/.exec(opts ?? '')?.[1]?.toLowerCase();
+    listings.push({ cap: capHtml(cap), lab, lang, code });
+    return `\n\nLSTBLOCK${listings.length - 1}X\n\n`;
+  });
+
   // env type of each theorem-like label (cleveref reports "Theorem" for every shared-counter env)
   const envOf = {};
   {
@@ -200,7 +216,7 @@ function preprocess(slug) {
     const typeName = (k) => {
       const l = labels[k]; if (!l) return null;
       if (envOf[k] && l.type === 'theorem') return envOf[k][0].toUpperCase() + envOf[k].slice(1);
-      return { section: 'Section', subsection: 'Section', subsubsection: 'Section', appendix: 'Appendix', subappendix: 'Appendix', table: 'Table', figure: 'Figure', equation: 'Eq.', paragraph: 'Section' }[l.type] ?? 'Section';
+      return { section: 'Section', subsection: 'Section', subsubsection: 'Section', appendix: 'Appendix', subappendix: 'Appendix', lstlisting: 'Listing', table: 'Table', figure: 'Figure', equation: 'Eq.', paragraph: 'Section' }[l.type] ?? 'Section';
     };
     const link = (k) => {
       const l = labels[k];
@@ -350,7 +366,7 @@ function preprocess(slug) {
   body = transform(body, true);
   const abstractOut = transform(abstractTex, false);
   const head = mathDefs + '\n';
-  return { labels, title, subtitle, author, date, macros, body: head + body, abstractTex: head + abstractOut };
+  return { listings, labels, title, subtitle, author, date, macros, body: head + body, abstractTex: head + abstractOut };
 }
 
 // ---------- pandoc + post-process ----------
@@ -415,7 +431,7 @@ function postprocess(html, macros, labels = {}) {
   // 3. leak check on text with math removed
   const leaks = [];
   const text = unesc(html.replace(/<pre[\s\S]*?<\/pre>|<code[\s\S]*?<\/code>/g, ' ').replace(/<[^>]+>/g, ' ').replace(/\u0001\d+\u0001/g, ' '));
-  for (const re of [/\\[A-Za-z]+/g, /\\[({\[]/g, /\$[^$\s][^$]*\$/g, /@@/g, /APPENDIXMARKER/g, /\?\?/g, /\\\\/g]) {
+  for (const re of [/LSTBLOCK/g, /\\[A-Za-z]+/g, /\\[({\[]/g, /\$[^$\s][^$]*\$/g, /@@/g, /APPENDIXMARKER/g, /\?\?/g, /\\\\/g]) {
     for (const m of text.matchAll(re)) leaks.push(text.slice(Math.max(0, m.index - 30), m.index + 40).replace(/\s+/g, ' '));
   }
   for (const re of [/class="(tabularx|longtable|small|citation)"/g, /data-reference-type/g, /<img[^>]*src="(?!\/)/g]) {
@@ -465,8 +481,14 @@ for (const p of PAPERS) {
   pandoc(bodyTex, rawHtml);
   pandoc(absTex, absHtml);
 
-  const main = postprocess(fs.readFileSync(rawHtml, 'utf8'), pre.macros, pre.labels);
-  const abs = postprocess(fs.readFileSync(absHtml, 'utf8'), pre.macros, pre.labels);
+  const withListings = (html) => html.replace(/<p>LSTBLOCK(\d+)X<\/p>/g, (_, i) => {
+    const l = pre.listings[+i];
+    const num = pre.labels[l.lab]?.num ?? (+i + 1);
+    const code = l.code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<figure class="listing"${l.lab ? ` id="${l.lab}"` : ''}>${l.cap ? `<figcaption><strong>Listing ${num}.</strong> ${l.cap}</figcaption>` : ''}<pre><code${l.lang ? ` class="language-${l.lang}"` : ''}>${code}</code></pre></figure>`;
+  });
+  const main = postprocess(withListings(fs.readFileSync(rawHtml, 'utf8')), pre.macros, pre.labels);
+  const abs = postprocess(withListings(fs.readFileSync(absHtml, 'utf8')), pre.macros, pre.labels);
   const abstractText = unesc(abs.html.replace(/<[^>]+>/g, ' ').replace(/&nbsp;/g, ' ')).replace(/\s+/g, ' ').trim();
 
   fs.writeFileSync(path.join(DIRS.content, p.slug + '.html'), main.html);

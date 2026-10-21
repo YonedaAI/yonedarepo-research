@@ -58,5 +58,20 @@
     "status": "published",
     "pdf": "/papers/serverless-git-on-cloudflare.pdf",
     "og": "/og/serverless-git-on-cloudflare.png"
+  },
+  {
+    "slug": "machine-checked-batch-landing",
+    "part": "Part IV",
+    "short": "Part IV",
+    "title": "Machine-Checked Batch Landing: Merge Resolution and Serializability in a Transactional Model of Source Control",
+    "subtitle": "Part IV of Source Code as a Transactional Abstraction",
+    "author": "Matthew Long",
+    "date": "October 2026",
+    "abstract": "Source code and source control can be treated as transactional abstractions: a repository is a database, a change is a transaction with a read set and a write set, and landing a change is a commit under optimistic concurrency. Part I of this series gave the transaction model behind that view and proved its properties by hand. This paper makes the core of that model machine-checked. A Lean 4 development of 180 theorems, with no unproved steps and no axioms beyond propositional extensionality and quotient soundness, formalizes paths and their overlap, tree states, transactions with read and write sets, the log and its snapshots, validation, and three-way merge at file and line granularity. The headline result concerns batch landing. Suppose every member of a batch validates as a fast-forward, a rebase or a conflict-free merge, no member reads or writes what an earlier member wrote, and every merged member is patch-compatible with the head. Then the batch installs the serial execution of its members in ticket order, and the declared-access serialization graph is acyclic. Patch compatibility is exact: a conflict-free merged landing equals running its transaction on the head if and only if the condition holds. Checked counterexamples show that neither hypothesis can be dropped, and that a blind write that never read its merged path breaks serial equivalence. The formalization also corrects Part I in four places; for example, Part I’s merge rule makes identical changes conflict. The theorems concern the model, not the implementation.",
+    "abstractHtml": "<p>Source code and source control can be treated as transactional abstractions: a repository is a database, a change is a transaction with a read set and a write set, and landing a change is a commit under optimistic concurrency. Part I of this series gave the transaction model behind that view and proved its properties by hand. This paper makes the core of that model machine-checked. A Lean 4 development of 180 theorems, with no unproved steps and no axioms beyond propositional extensionality and quotient soundness, formalizes paths and their overlap, tree states, transactions with read and write sets, the log and its snapshots, validation, and three-way merge at file and line granularity. The headline result concerns batch landing. Suppose every member of a batch validates as a fast-forward, a rebase or a conflict-free merge, no member reads or writes what an earlier member wrote, and every merged member is patch-compatible with the head. Then the batch installs the serial execution of its members in ticket order, and the declared-access serialization graph is acyclic. Patch compatibility is exact: a conflict-free merged landing equals running its transaction on the head if and only if the condition holds. Checked counterexamples show that neither hypothesis can be dropped, and that a blind write that never read its merged path breaks serial equivalence. The formalization also corrects Part I in four places; for example, Part I’s merge rule makes identical changes conflict. The theorems concern the model, not the implementation.</p>\n",
+    "pages": 38,
+    "status": "published",
+    "pdf": "/papers/machine-checked-batch-landing.pdf",
+    "og": "/og/machine-checked-batch-landing.png"
   }
 ]

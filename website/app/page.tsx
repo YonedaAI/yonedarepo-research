@@ -1,7 +1,7 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { papers, excerpt, SERIES, THESIS } from "@/lib/papers";
-import { ArrowIcon, BranchIcon, CheckIcon, DownloadIcon, LayersIcon, LogIcon } from "@/components/Icons";
+import { ArrowIcon, BranchIcon, CheckIcon, DownloadIcon, ExternalIcon, LayersIcon, LogIcon } from "@/components/Icons";
 
 export const metadata: Metadata = {
   title: SERIES,
@@ -34,6 +34,27 @@ const results = [
     title: "When Git catches up",
     body: "A change is final the moment it enters the transaction log. The Git copy that git clone sees is rebuilt in the background and trails by a few seconds.",
     caveat: "On an earlier build the lag was 17 s.",
+  },
+];
+
+const checked = [
+  {
+    value: "180 theorems",
+    title: "Checked by a computer, step by step",
+    body: "The core rules (how changes are logged, checked and merged) are written in the Lean proof language, and Lean verifies every proof. No step is skipped or taken on trust.",
+    caveat: "The proofs cover the design, not the running code.",
+  },
+  {
+    value: "Batch = one at a time",
+    title: "Landing many changes at once is safe",
+    body: "When the system lands a batch of changes together, including merged ones, the result is exactly what you would get by landing them one after another.",
+    caveat: "Holds when no change reads or writes a file an earlier change in the same batch wrote, and merges don't write back stale content. Merges are modelled line by line with stable line identities; shifting line numbers are not covered.",
+  },
+  {
+    value: "Bug found",
+    title: "Why the extra check is needed",
+    body: "Without a check between changes in the same batch, two changes can each pass on their own yet produce a result no one-at-a-time order could. The analysis in Part I found this, Lean confirms it, and the fix is now in the code.",
+    caveat: "Shown with a concrete example. The test workloads do not yet exercise the check.",
   },
 ];
 
@@ -76,6 +97,24 @@ export default function Home() {
         </div>
         <p className="result-link">
           <Link href="/papers/serverless-git-on-cloudflare/#sec:sgoc:batch">How it was measured, in Part III</Link>
+        </p>
+      </section>
+
+      <section aria-labelledby="checked-h" className="block">
+        <h2 id="checked-h" className="block-title">Machine-checked</h2>
+        <div className="results">
+          {checked.map((r) => (
+            <div key={r.title} className="result">
+              <div className="result-value">{r.value}</div>
+              <div className="result-title">{r.title}</div>
+              <p className="result-body">{r.body}</p>
+              <p className="result-caveat">{r.caveat}</p>
+            </div>
+          ))}
+        </div>
+        <p className="result-link result-links">
+          <Link href="/papers/machine-checked-batch-landing/">Read Part IV</Link>
+          <a href="https://github.com/YonedaAI/yonedarepo-research/tree/main/lean" target="_blank" rel="noreferrer">Lean source on GitHub <ExternalIcon /></a>
         </p>
       </section>
 
@@ -134,6 +173,14 @@ export default function Home() {
             <p>
               An object store, one serialized authority per repository, a durable queue and stateless compute are enough. The
               reference implementation runs on Cloudflare, and the paper measures where the authority saturates.
+            </p>
+          </div>
+          <div className="how-item">
+            <span className="chip">Part IV</span>
+            <h3>Machine-checked batch landing</h3>
+            <p>
+              A Lean 4 development formalizes the core of the model and proves that an accepted batch, merges included, installs
+              the serial execution of its members, with checked counterexamples showing that neither hypothesis can be dropped.
             </p>
           </div>
           <div className="how-item">

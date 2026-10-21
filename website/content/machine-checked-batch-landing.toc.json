@@ -1,0 +1,188 @@
+[
+ {
+  "id": "sec:mcbl:intro",
+  "num": "1",
+  "text": "Introduction",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:model",
+  "num": "2",
+  "text": "The formal model",
+  "level": 2
+ },
+ {
+  "id": "paths-and-overlap",
+  "num": "2.1",
+  "text": "Paths and overlap",
+  "level": 3
+ },
+ {
+  "id": "states-and-agreement",
+  "num": "2.2",
+  "text": "States and agreement",
+  "level": 3
+ },
+ {
+  "id": "transactions",
+  "num": "2.3",
+  "text": "Transactions",
+  "level": 3
+ },
+ {
+  "id": "the-log-and-its-snapshots",
+  "num": "2.4",
+  "text": "The log and its snapshots",
+  "level": 3
+ },
+ {
+  "id": "validation",
+  "num": "2.5",
+  "text": "Validation",
+  "level": 3
+ },
+ {
+  "id": "three-way-merge",
+  "num": "2.6",
+  "text": "Three-way merge",
+  "level": 3
+ },
+ {
+  "id": "lines-with-stable-keys",
+  "num": "2.7",
+  "text": "Lines with stable keys",
+  "level": 3
+ },
+ {
+  "id": "batches",
+  "num": "2.8",
+  "text": "Batches",
+  "level": 3
+ },
+ {
+  "id": "serialization-graph",
+  "num": "2.9",
+  "text": "Serialization graph",
+  "level": 3
+ },
+ {
+  "id": "sec:mcbl:single",
+  "num": "3",
+  "text": "Single landings",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:merge",
+  "num": "4",
+  "text": "Merge resolution",
+  "level": 2
+ },
+ {
+  "id": "laws-of-the-three-way-merge",
+  "num": "4.1",
+  "text": "Laws of the three-way merge",
+  "level": 3
+ },
+ {
+  "id": "line-level-refinement",
+  "num": "4.2",
+  "text": "Line-level refinement",
+  "level": 3
+ },
+ {
+  "id": "patch-compatibility",
+  "num": "4.3",
+  "text": "Patch compatibility",
+  "level": 3
+ },
+ {
+  "id": "sec:mcbl:batch",
+  "num": "5",
+  "text": "Batch landing soundness",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:underdeclared",
+  "num": "6",
+  "text": "Under-declared reads",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:witnesses",
+  "num": "7",
+  "text": "Non-vacuity",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:findings",
+  "num": "8",
+  "text": "Findings from the formalization",
+  "level": 2
+ },
+ {
+  "id": "the-merge-rule-and-idempotence",
+  "num": "8.1",
+  "text": "The merge rule and idempotence",
+  "level": 3
+ },
+ {
+  "id": "the-frame-lemma-and-its-two-regions",
+  "num": "8.2",
+  "text": "The frame lemma and its two regions",
+  "level": 3
+ },
+ {
+  "id": "merged-landings-and-patch-compatibility",
+  "num": "8.3",
+  "text": "Merged landings and patch compatibility",
+  "level": 3
+ },
+ {
+  "id": "the-premise-behind-undeclared-reads",
+  "num": "8.4",
+  "text": "The premise behind undeclared reads",
+  "level": 3
+ },
+ {
+  "id": "sec:mcbl:limits",
+  "num": "9",
+  "text": "Limits of the formalization",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:tcb",
+  "num": "10",
+  "text": "Trusted computing base",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:relation",
+  "num": "11",
+  "text": "Relation to Parts I to III and the synthesis",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:related",
+  "num": "12",
+  "text": "Related work",
+  "level": 2
+ },
+ {
+  "id": "sec:mcbl:conclusion",
+  "num": "13",
+  "text": "Conclusion",
+  "level": 2
+ },
+ {
+  "id": "references",
+  "num": "",
+  "text": "References",
+  "level": 2
+ },
+ {
+  "id": "app:mcbl:evidence",
+  "num": "A",
+  "text": "Code evidence",
+  "level": 2
+ }
+]
