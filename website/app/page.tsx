@@ -17,9 +17,24 @@ const steps = [
 ];
 
 const results = [
-  { value: "1,000 of 1,000", label: "landed in each of 6 hosted bursts at 1,000 writers" },
-  { value: "714–1,673 ms", label: "commit p95 (per-writer tokens)" },
-  { value: "3.2–5.4 s", label: "Git projection delay p95" },
+  {
+    value: "1,000 / 1,000",
+    title: "Every change landed",
+    body: "1,000 simulated agents pushed changes to the same branch within seconds. All 1,000 landed in each of 6 runs, and no request was refused. The previous design, which built Git trees while landing, got 4 of 1,000 through under the same load.",
+    caveat: "Short bursts. A sustained-load test is still to come.",
+  },
+  {
+    value: "0.7–1.7 s",
+    title: "Time to save a change",
+    body: "With 1,000 agents writing at once, 95% of commits were saved within this time.",
+    caveat: "Under 1 s in 2 of 3 runs. With one shared login for all agents it was 1.1–1.6 s.",
+  },
+  {
+    value: "3.2–5.4 s",
+    title: "When Git catches up",
+    body: "A change is final the moment it enters the transaction log. The Git copy that git clone sees is rebuilt in the background and trails by a few seconds.",
+    caveat: "On an earlier build the lag was 17 s.",
+  },
 ];
 
 export default function Home() {
@@ -44,16 +59,24 @@ export default function Home() {
       </section>
 
       <section aria-labelledby="results-h" className="block">
-        <h2 id="results-h" className="block-title">Key results</h2>
+        <h2 id="results-h" className="block-title">What we measured</h2>
+        <p className="block-lede">
+          The test: 1,000 agents writing to one branch of one repository at the same moment, on the
+          reference build running on Cloudflare.
+        </p>
         <div className="results">
           {results.map((r) => (
-            <div key={r.value} className="result">
+            <div key={r.title} className="result">
               <div className="result-value">{r.value}</div>
-              <div className="result-label">{r.label}</div>
-              <div className="result-note">measured, see Part III</div>
+              <div className="result-title">{r.title}</div>
+              <p className="result-body">{r.body}</p>
+              <p className="result-caveat">{r.caveat}</p>
             </div>
           ))}
         </div>
+        <p className="result-link">
+          <Link href="/papers/serverless-git-on-cloudflare/#sec:sgoc:batch">How it was measured, in Part III</Link>
+        </p>
       </section>
 
       <section aria-labelledby="papers-h" className="block">
