@@ -14,6 +14,19 @@ The argument rests on precedent. Data lakes moved from files on object stores to
 | Part I | A Transaction Log for Source Control | 35 | [transaction-log-source-control.pdf](papers/pdf/transaction-log-source-control.pdf) |
 | Part II | Partitioned Derived Data | 36 | [partitioned-derived-data.pdf](papers/pdf/partitioned-derived-data.pdf) |
 | Part III | A Cloud-Portable Architecture for Serverless Git | 35 | [serverless-git-on-cloudflare.pdf](papers/pdf/serverless-git-on-cloudflare.pdf) |
+| Part IV | Machine-Checked Batch Landing: Merge Resolution and Serializability in a Transactional Model of Source Control | 38 | [machine-checked-batch-landing.pdf](papers/pdf/machine-checked-batch-landing.pdf) |
+
+## Machine-checked proofs (Lean 4)
+
+`lean/` is a Lake project, `YonedaTx`. It contains 180 theorem declarations with no `sorry`, uses only the axioms `propext` and `Quot.sound`, and depends on core Lean 4 v4.35.0 alone (no Mathlib). Build it with `cd lean && lake build`, which takes about 3 s from clean.
+
+- `batch_landing_sound`: an accepted batch of changesets, merges included, equals serial execution in ticket order, and its declared-access serialization graph is acyclic.
+- `merge_serial_iff`: a merged landing is serializable exactly when the change is patch-compatible with the head, meaning it never writes a stale base value back over a path the head moved.
+- `batch_rule_needed`: without the pairwise check, a two-change batch is accepted, matches neither serial order and has a cycle in its serialization graph.
+- `line_merge_refines`: different edits to one file merge cleanly at line granularity, where lines have stable keys.
+- `under_declared_*`: reads that are not declared can break serializability. Write checks alone still prevent lost updates, and a tight condition says when undeclared reads are safe.
+
+Not covered: positional diff3 (insertions that shift line numbers), multiple refs, and the implementation code. The theorems are about the model. See `lean/README.md` for the mapping from paper results to Lean theorems. An adversarial Codex review of the Lean code ran 2 rounds. Round 1 found 3 major scope issues: validation was overstated as "exact", merges were file-atomic, and a sufficient condition was called "exact". All 3 were fixed. Round 2 confirmed the fixes.
 
 LaTeX sources are in `papers/latex/`, and HTML versions are in `docs/papers/`.
 
