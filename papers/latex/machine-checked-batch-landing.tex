@@ -770,7 +770,7 @@ theorem merge_not_serial :
 Let $x=y=0$ initially. The entry $c_x$ sets $x$ to $1$ as a fast-forward, so the head has $x=1$ and $y=0$. The changeset $m$, built on version 0, declares $\W=\{x,y\}$ and $\R=\varnothing$, and carries $x=0$ and $y=1$. Its write set meets the later write $\{x\}$ and its empty read set meets nothing, so validation returns $\Mg$. The change differs from its base only at $y$, which the head did not move, so there is no conflict path, and a single member satisfies the pairwise rule. The merge keeps the head's $x=1$ and sets $y=1$. Running $m$ on the head gives $x=0$ and $y=1$. Patch compatibility fails at $x$, where $\Phi(x)=B(x)=0$ but $H(x)=1$. Lean evaluates each claim.
 \end{proof}
 
-The example matters because it defeats the two conditions one would try first. One might expect a blind write to be safe, since it reads nothing that could be stale, and one might expect a merged path outside the read set to be safe, since no read of it can be invalidated. The member $m$ is both, and its merged landing is still not the serial execution of $m$ on the head. The landed state is arguably the one the writer wanted: it keeps $c_x$'s update to $x$, which $m$ never meant to change, and no update is lost. But it is not the state of any serial execution of the transactions as submitted, because the transaction $m$ says that $x$ becomes $0$. A serializability statement about merged landings must therefore either describe them as patches, as the serial merge of Definition~\ref{def:mcbl:serial} does, or assume patch compatibility.
+The example matters because it defeats the two conditions one would try first. One might expect a blind write to be safe, since it reads nothing that could be stale, and one might expect a merged path outside the read set to be safe, since no read of it can be invalidated. The member $m$ is both, and its merged landing is still not the serial execution of $m$ on the head. The landed state is arguably the one the writer wanted: it keeps $c_x$'s update to $x$, which $m$ never meant to change, and no update is lost. But it is not the state of serial execution in landing order ($c_x$, then $m$), because the transaction $m$ says that $x$ becomes $0$. It is the state of the other serial order, $m$ then $c_x$: the merge places $m$'s stale write of $x$ before $c_x$'s, as Thomas's write rule does for obsolete writes \cite[Section~4.5]{bhg1987}. The theorem shows only that the merged landing differs from serial execution in ticket order; it does not show that no serial order explains it. A serializability statement in ticket order about merged landings must therefore either describe them as patches, as the serial merge of Definition~\ref{def:mcbl:serial} does, or assume patch compatibility.
 
 \section{Batch landing soundness}
 \label{sec:mcbl:batch}
@@ -1099,7 +1099,7 @@ Part I's lemma remains correct as stated, because its agreement excludes ancesto
 
 \subsection{Merged landings and patch compatibility}
 
-Part I's Proposition~7.4 excludes members validated as Merge, and its Proposition~6.5 describes the merged state without a serializability claim. The formalization extends the batch result to Merge members and shows what the extension costs. Two hypotheses suggest themselves: that the merged member is a blind write, so no read can be stale, and that its merged paths lie outside its read set. Proposition~\ref{prop:mcbl:mergece} satisfies both and is not serial. The exact condition for one member is patch compatibility (Theorem~\ref{thm:mcbl:mergeiff}), and under it the batch theorem covers Merge members (Theorem~\ref{thm:mcbl:sound}).
+Part I's Proposition~7.4 excludes members validated as Merge, and its Proposition~6.5 describes the merged state without a serializability claim. The formalization extends the batch result to Merge members and shows what the extension costs. Two hypotheses suggest themselves: that the merged member is a blind write, so no read can be stale, and that its merged paths lie outside its read set. Proposition~\ref{prop:mcbl:mergece} satisfies both and is not serial in ticket order. The exact condition for one member is patch compatibility (Theorem~\ref{thm:mcbl:mergeiff}), and under it the batch theorem covers Merge members (Theorem~\ref{thm:mcbl:sound}).
 
 The correction to Part I concerns changesets. Part I's Definition~8.1 appends a changeset validated as Merge with the effective change produced by the three-way merge, and its Proposition~8.3(3) states that, for FastForward and Rebase, the new branch state is the previous one with $\Phi$ applied. Theorem~\ref{thm:mcbl:mergeiff} and Proposition~\ref{prop:mcbl:pcclean} show that the effective change of a merged changeset equals $\Phi$ on $\W$ exactly when no written path whose content equals its base content was moved by the head. Statements about merged changesets that speak of applying $\Phi$ need that condition.
 
@@ -1268,6 +1268,10 @@ The serializability arguments are classical. Kung and Robinson's serial validati
 
 The write-write case is where source control differs from a database, and the three-way merge is its mechanism. Khanna, Kunal and Pierce give a formal investigation of \code{diff3} and show that several properties one would expect of it fail in general \cite{khanna2007diff3}. The model here sidesteps their difficulties by merging per location and treating lines as locations with stable keys. It is therefore a statement about an idealized merge, and its laws should be read alongside their negative results. The transaction log itself follows the lakehouse formats, of which Delta Lake is the model for this series \cite{armbrust2020delta}. Lean~4 is described by de Moura and Ullrich \cite{demoura2021lean4}.
 
+The batch results have close precedents in deterministic and batched databases. Aria validates a batch of transactions against a snapshot and commits a transaction only if it has no write-after-write or read-after-write dependency on an earlier transaction in the batch; its serializability theorem gives serial execution in input order \cite{lu2020aria}. That rule is the pairwise rule of this paper, and for fast-forward and rebase members the batch result here is the same idea, machine-checked in a source-control model. Ding, Kot and Gehrke batch optimistic transactions and reorder them using an intra-batch dependency graph \cite{ding2018batching}, and they also discuss the write skew that per-member validation admits. What these systems do not have is a three-way merge: the extension to merged members, and the patch-compatibility condition it needs, has no counterpart there that we found. The merge counterexample is an instance of Thomas's write rule, under which an obsolete write is ignored and the result corresponds to a different serial order \cite[Section~4.5]{bhg1987}.
+
+On the merge side, Swierstra and L\"oh give a formal semantics of version control in which lines carry unique labels and independent patches merge, with a Coq model \cite{swierstra2014semantics}. The line-level refinement here is the same abstraction. Sousa, Dillig and Lahiri verify three-way program merges against semantic conflict freedom, a property stated in terms of re-execution \cite{sousa2018merge}. Mechanized proofs of isolation and transaction libraries exist for databases, for example VerIso for isolation guarantees \cite{ghasemirad2025veriso} and vMVCC for a multi-version transaction library \cite{chang2023vmvcc}. A search of these and related sources (30 sources, more than 40 queries) found no mechanized serializability proof for a Git-like source-control model with merges. Some bibliographic search services were unavailable during the search, so this is an absence of evidence, not a claim of priority.
+
 \section{Conclusion}
 \label{sec:mcbl:conclusion}
 
@@ -1358,6 +1362,42 @@ YonedaTx: Lean 4 formalization of the transactional model of source control.
 Directory \texttt{lean/} of the repository YonedaAI/yonedarepo-research, October 2026.
 \url{https://github.com/YonedaAI/yonedarepo-research/tree/main/lean}.
 
+\bibitem{lu2020aria}
+Y.~Lu, X.~Yu, L.~Cao, and S.~Madden.
+\newblock Aria: A fast and practical deterministic {OLTP} database.
+\newblock \emph{Proceedings of the VLDB Endowment}, 13:2047-2060, 2020.
+\newblock doi:10.14778/3407790.3407808.
+
+\bibitem{ding2018batching}
+B.~Ding, L.~Kot, and J.~Gehrke.
+\newblock Improving optimistic concurrency control through transaction batching and operation reordering.
+\newblock \emph{Proceedings of the VLDB Endowment}, 12(2):169-182, 2018.
+\newblock doi:10.14778/3282495.3282502.
+
+\bibitem{swierstra2014semantics}
+W.~Swierstra and A.~L\"oh.
+\newblock The semantics of version control.
+\newblock In \emph{Onward! 2014}, pages 43-54. ACM, 2014.
+\newblock doi:10.1145/2661136.2661137.
+
+\bibitem{sousa2018merge}
+M.~Sousa, I.~Dillig, and S.~K. Lahiri.
+\newblock Verified three-way program merge.
+\newblock \emph{Proceedings of the ACM on Programming Languages}, 2(OOPSLA):1-29, 2018.
+\newblock doi:10.1145/3276535.
+
+\bibitem{ghasemirad2025veriso}
+S.~Ghasemirad, S.~Liu, C.~Sprenger, L.~Multazzu, and D.~Basin.
+\newblock {VerIso}: Verifiable isolation guarantees for database transactions.
+\newblock \emph{Proceedings of the VLDB Endowment}, 18(5):1362-1375, 2025.
+\newblock doi:10.14778/3718057.3718065.
+
+\bibitem{chang2023vmvcc}
+Y.-S. Chang, R.~Jung, U.~Sharma, J.~Tassarotti, M.~F. Kaashoek, and N.~Zeldovich.
+\newblock Verifying {vMVCC}, a high-performance transaction library using multi-version concurrency control.
+\newblock In \emph{17th USENIX Symposium on Operating Systems Design and Implementation (OSDI 23)}, 2023.
+\newblock \url{https://www.usenix.org/conference/osdi23/presentation/chang}.
+
 \end{thebibliography}
 
 \appendix
@@ -1409,7 +1449,7 @@ Row & Claim & File & Lines & What the code shows \\
 27 & Edits to disjoint lines of one file merge cleanly by line & \code{lean/YonedaTx/Merge.lean} & 204 & Listing~\ref{lst:mcbl:linerefine}: If every line is unchanged on one side, no line is a conflict path, and each line's merge applies the diff of either side to the other. \\
 28 & Merged landing is a serial step iff patch-compatible & \code{lean/YonedaTx/Batch.lean} & 157 & Listing~\ref{lst:mcbl:mergeiff}: For a conflict-free member, the merge with H equals running the transaction on H if and only if \code{PatchCompatible} holds. \\
 29 & Patch compatibility of clean members and of changesets & \code{lean/YonedaTx/Batch.lean} & 170, 183 & Listing~\ref{lst:mcbl:pcagree}: Agreement of base and head on R and W gives patch compatibility. For a changeset it holds iff no written path left at its base content was moved by the head. \\
-30 & A blind write with an unread merged path is not serial & \code{lean/YonedaTx/Soundness.lean} & 258, 262, 264, 280 & Listing~\ref{lst:mcbl:mergece}: The changeset m declares x and y with no reads, is validated as Merge with no conflict path and accepted, yet the batch differs from running m on the head and m is not patch-compatible. \\
+30 & A blind write with an unread merged path is not serial in ticket order & \code{lean/YonedaTx/Soundness.lean} & 258, 262, 264, 280 & Listing~\ref{lst:mcbl:mergece}: The changeset m declares x and y with no reads, is validated as Merge with no conflict path and accepted, yet the batch differs from running m on the head and m is not patch-compatible. \\
 31 & Headline: batch landing soundness & \code{lean/YonedaTx/Soundness.lean} & 181 & Listing~\ref{lst:mcbl:sound}: For a log with no Conflict and an accepted batch whose Merge members are patch-compatible, the batch equals serial execution in ticket order, equals the final snapshot of the log followed by the members, and the graph has no cycle. \\
 32 & Octopus equals sequential equals serial & \code{lean/YonedaTx/Batch.lean} & 87, 120, 219 & Listing~\ref{lst:mcbl:batchlemmas}: Disjoint writes make the octopus merge equal sequential landing. No conflict path makes that the serial merge. The rule and patch compatibility make that serial execution. \\
 33 & The members appended to the log & \code{lean/YonedaTx/Soundness.lean} & 91, 111 & Listing~\ref{lst:mcbl:noconf}: After j members the snapshot is the sequential landing of the first j. The log followed by an accepted batch has no Conflict landing. \\
